@@ -17,4 +17,8 @@ todo = "warn"
 unwrap_used = "warn"
 
 [profile.release]
+opt-level = "z"
+lto = "fat"
+codegen-units = 1
+panic = "abort"
 strip = true
