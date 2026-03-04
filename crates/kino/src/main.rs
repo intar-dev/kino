@@ -8,6 +8,7 @@ mod state;
 use anyhow::Context;
 use clap::Parser;
 use std::future::IntoFuture;
+use std::io::ErrorKind;
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -39,13 +40,55 @@ async fn main() -> anyhow::Result<()> {
     let probe_tasks = scheduler::spawn_probe_tasks(shared_probes, &store);
 
     let router = http::build_router(store);
-    let listener = tokio::net::TcpListener::bind(app_config.server_addr)
-        .await
-        .with_context(|| format!("failed to bind to {}", app_config.server_addr))?;
+    let server = match app_config.server_bind {
+        config::ServerBind::Tcp(addr) => {
+            let listener = tokio::net::TcpListener::bind(addr)
+                .await
+                .with_context(|| format!("failed to bind to {addr}"))?;
 
-    eprintln!("kino listening on {}", app_config.server_addr);
+            eprintln!("kino listening on {addr}");
+            axum::serve(listener, router).into_future()
+        }
+        config::ServerBind::Unix(path) => {
+            #[cfg(unix)]
+            {
+                if let Some(parent) = path.parent()
+                    && !parent.as_os_str().is_empty()
+                {
+                    tokio::fs::create_dir_all(parent).await.with_context(|| {
+                        format!(
+                            "failed to create parent directories for unix socket {}",
+                            path.display()
+                        )
+                    })?;
+                }
 
-    let server = axum::serve(listener, router).into_future();
+                match tokio::fs::remove_file(&path).await {
+                    Ok(()) => {}
+                    Err(error) if error.kind() == ErrorKind::NotFound => {}
+                    Err(error) => {
+                        return Err(error).with_context(|| {
+                            format!("failed to remove existing unix socket {}", path.display())
+                        });
+                    }
+                }
+
+                let listener = tokio::net::UnixListener::bind(&path)
+                    .with_context(|| format!("failed to bind unix socket {}", path.display()))?;
+
+                eprintln!("kino listening on unix socket {}", path.display());
+                axum::serve(listener, router).into_future()
+            }
+            #[cfg(not(unix))]
+            {
+                anyhow::bail!(
+                    "unix socket binding is not supported on this platform: {}",
+                    path.display()
+                );
+            }
+        }
+    };
+
     tokio::pin!(server);
 
     let server_result = tokio::select! {

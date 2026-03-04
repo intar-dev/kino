@@ -10,8 +10,14 @@ use thiserror::Error;
 
 #[derive(Debug, Clone)]
 pub(crate) struct AppConfig {
-    pub(crate) server_addr: SocketAddr,
+    pub(crate) server_bind: ServerBind,
     pub(crate) probes: Vec<ProbeConfig>,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) enum ServerBind {
+    Tcp(SocketAddr),
+    Unix(PathBuf),
 }
 
 #[derive(Debug, Clone)]
@@ -196,8 +202,9 @@ struct RawConfig {
 
 #[derive(Debug, Deserialize)]
 struct RawServer {
-    bind: String,
-    port: u16,
+    bind: Option<String>,
+    port: Option<u16>,
+    unix_socket: Option<PathBuf>,
 }
 
 #[derive(Debug, Deserialize, Default)]
@@ -258,17 +265,7 @@ pub(crate) fn load_from_file(path: &Path) -> Result<AppConfig, ConfigError> {
         hcl::from_str(&content).map_err(|source| ConfigError::ParseHcl { source })?;
 
     let defaults = normalize_defaults(raw.defaults)?;
-
-    let bind_ip = raw
-        .server
-        .bind
-        .parse::<IpAddr>()
-        .map_err(|error| ConfigError::Validation {
-            message: format!(
-                "server.bind '{}' is not a valid IP address: {error}",
-                raw.server.bind
-            ),
-        })?;
+    let server_bind = resolve_server_bind(raw.server)?;
 
     let probes = raw
         .probe
@@ -277,9 +274,45 @@ pub(crate) fn load_from_file(path: &Path) -> Result<AppConfig, ConfigError> {
         .collect::<Result<Vec<_>, _>>()?;
 
     Ok(AppConfig {
-        server_addr: SocketAddr::new(bind_ip, raw.server.port),
+        server_bind,
         probes,
     })
+}
+
+fn resolve_server_bind(raw_server: RawServer) -> Result<ServerBind, ConfigError> {
+    let has_tcp = raw_server.bind.is_some() || raw_server.port.is_some();
+    let has_unix = raw_server.unix_socket.is_some();
+
+    if has_tcp && has_unix {
+        return Err(ConfigError::Validation {
+            message: "server must define either (bind + port) or unix_socket, not both".to_owned(),
+        });
+    }
+
+    if has_unix && let Some(path) = raw_server.unix_socket {
+        return Ok(ServerBind::Unix(path));
+    }
+
+    if !has_tcp {
+        return Err(ConfigError::Validation {
+            message: "server must define either (bind + port) or unix_socket".to_owned(),
+        });
+    }
+
+    let bind = raw_server.bind.ok_or_else(|| ConfigError::Validation {
+        message: "server.bind is required when unix_socket is not set".to_owned(),
+    })?;
+    let port = raw_server.port.ok_or_else(|| ConfigError::Validation {
+        message: "server.port is required when unix_socket is not set".to_owned(),
+    })?;
+
+    let bind_ip = bind
+        .parse::<IpAddr>()
+        .map_err(|error| ConfigError::Validation {
+            message: format!("server.bind '{bind}' is not a valid IP address: {error}"),
+        })?;
+
+    Ok(ServerBind::Tcp(SocketAddr::new(bind_ip, port)))
 }
 
 fn normalize_defaults(raw_defaults: Option<RawDefaults>) -> Result<EffectiveDefaults, ConfigError> {
@@ -429,7 +462,7 @@ fn timeout_or_default(
 
 #[cfg(test)]
 mod tests {
-    use super::{DesiredPodState, load_from_file};
+    use super::{DesiredPodState, ServerBind, load_from_file};
     use std::fs;
     use std::str::FromStr;
 
@@ -478,8 +511,93 @@ mod tests {
             Err(error) => panic!("failed to parse config: {error}"),
         };
 
-        assert_eq!(config.server_addr.port(), 9000);
+        match config.server_bind {
+            ServerBind::Tcp(addr) => assert_eq!(addr.port(), 9000),
+            ServerBind::Unix(path) => panic!("unexpected unix socket binding: {}", path.display()),
+        }
         assert_eq!(config.probes.len(), 2);
+    }
+
+    #[test]
+    fn parses_unix_socket_server_binding() {
+        let temp = tempfile::tempdir();
+        assert!(temp.is_ok());
+        let dir = match temp {
+            Ok(value) => value,
+            Err(error) => panic!("failed to create tempdir: {error}"),
+        };
+
+        let socket_path = dir.path().join("kino.sock");
+        let config_path = dir.path().join("kino.hcl");
+        let hcl = format!(
+            r#"
+            server {{
+              unix_socket = "{}"
+            }}
+        "#,
+            socket_path.display()
+        );
+
+        let write_result = fs::write(&config_path, hcl);
+        assert!(write_result.is_ok());
+
+        let loaded = load_from_file(&config_path);
+        assert!(loaded.is_ok());
+        let config = match loaded {
+            Ok(value) => value,
+            Err(error) => panic!("failed to parse config: {error}"),
+        };
+
+        match config.server_bind {
+            ServerBind::Unix(path) => assert_eq!(path, socket_path),
+            ServerBind::Tcp(addr) => panic!("unexpected tcp binding: {addr}"),
+        }
+    }
+
+    #[test]
+    fn rejects_mixed_tcp_and_unix_server_binding() {
+        let temp = tempfile::tempdir();
+        assert!(temp.is_ok());
+        let dir = match temp {
+            Ok(value) => value,
+            Err(error) => panic!("failed to create tempdir: {error}"),
+        };
+
+        let config_path = dir.path().join("kino.hcl");
+        let hcl = r#"
+            server {
+              bind = "127.0.0.1"
+              port = 9000
+              unix_socket = "/tmp/kino.sock"
+            }
+        "#;
+
+        let write_result = fs::write(&config_path, hcl);
+        assert!(write_result.is_ok());
+
+        let loaded = load_from_file(&config_path);
+        assert!(loaded.is_err());
+    }
+
+    #[test]
+    fn rejects_server_binding_when_missing_tcp_and_unix_values() {
+        let temp = tempfile::tempdir();
+        assert!(temp.is_ok());
+        let dir = match temp {
+            Ok(value) => value,
+            Err(error) => panic!("failed to create tempdir: {error}"),
+        };
+
+        let config_path = dir.path().join("kino.hcl");
+        let hcl = r"
+            server {}
+        ";
+
+        let write_result = fs::write(&config_path, hcl);
+        assert!(write_result.is_ok());
+
+        let loaded = load_from_file(&config_path);
+        assert!(loaded.is_err());
     }
 
     #[test]
