@@ -85,8 +85,13 @@ jobs:
 
       - name: Verify binary is static
         run: |
-          file target/${{ matrix.target }}/release/kino
-          file target/${{ matrix.target }}/release/kino | grep -q "statically linked"
+          binary="target/${{ matrix.target }}/release/kino"
+          file "${binary}"
+          if readelf -d "${binary}" | grep -q "NEEDED"; then
+            echo "Binary has dynamic library dependencies:" >&2
+            readelf -d "${binary}" >&2
+            exit 1
+          fi
 
       - name: Package binary
         run: |
