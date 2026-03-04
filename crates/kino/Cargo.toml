@@ -1,0 +1,32 @@
+[package]
+name = "kino"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+anyhow = "1.0.102"
+axum = { version = "0.8.8", default-features = false, features = ["http1", "tokio"] }
+clap = { version = "4.5.60", features = ["derive"] }
+hcl-rs = "0.19.6"
+k8s-openapi = { version = "0.27.0", features = ["v1_35"] }
+kube = { version = "3.0.1", default-features = false, features = ["client", "config", "rustls-tls"] }
+prost = "0.14.3"
+regex = "1.12.3"
+rustls = { version = "0.23.37", default-features = false, features = ["ring"] }
+serde = { version = "1.0.228", features = ["derive"] }
+thiserror = "2.0.18"
+tokio = { version = "1.50.0", features = ["fs", "macros", "net", "rt-multi-thread", "signal", "sync", "time"] }
+
+[build-dependencies]
+prost-build = "0.14.3"
+protoc-bin-vendored = "3.2.0"
+
+[dev-dependencies]
+tempfile = "3.26.0"
+tower = { version = "0.5.3", features = ["util"] }
