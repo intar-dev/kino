@@ -68,7 +68,7 @@ jobs:
       - name: Package binary and checksum
         run: |
           mkdir -p dist
-          asset_base="kino-${{ github.ref_name }}-linux-${{ matrix.arch }}"
+          asset_base="${{ github.ref_name }}-linux-${{ matrix.arch }}"
           cp target/${{ matrix.target }}/release/kino "dist/${asset_base}"
           chmod +x "dist/${asset_base}"
           sha512sum "dist/${asset_base}" > "dist/${asset_base}.sha512"
@@ -78,6 +78,6 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           gh release upload "${{ github.ref_name }}" \
-            "dist/kino-${{ github.ref_name }}-linux-${{ matrix.arch }}" \
-            "dist/kino-${{ github.ref_name }}-linux-${{ matrix.arch }}.sha512" \
+            "dist/${{ github.ref_name }}-linux-${{ matrix.arch }}" \
+            "dist/${{ github.ref_name }}-linux-${{ matrix.arch }}.sha512" \
             --clobber
