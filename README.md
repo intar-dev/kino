@@ -21,5 +21,6 @@ Implemented probe types:
 Operational model:
 
 - Designed to run as a systemd service (`kino --config /etc/kino/kino.hcl`)
-- Includes Docker-based smoke testing with a single-node k8s runtime
+- Includes Docker-based smoke testing for both the probe service and SSH recording flows
+- Smoke Dockerfiles live under `docker/smoke/`
 - CI runs `just check` and `just docker-smoke` in one pipeline

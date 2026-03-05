@@ -2,11 +2,12 @@ mod config;
 mod http;
 mod probe;
 mod proto;
+mod recording;
 mod scheduler;
 mod state;
 
 use anyhow::Context;
-use clap::Parser;
+use clap::{Parser, Subcommand};
 use std::future::IntoFuture;
 use std::io::ErrorKind;
 use std::path::PathBuf;
@@ -14,19 +15,71 @@ use std::sync::Arc;
 
 #[derive(Debug, Parser)]
 #[command(name = "kino")]
-#[command(about = "Asynchronous probe service for ephemeral VM validation")]
+#[command(about = "Probe service and in-VM SSH recorder for ephemeral VM validation")]
 struct Cli {
+    #[command(subcommand)]
+    command: Option<Command>,
     #[arg(long, value_name = "PATH")]
-    config: PathBuf,
+    config: Option<PathBuf>,
+}
+
+#[derive(Debug, Subcommand)]
+enum Command {
+    RecordSsh {
+        #[arg(long, value_name = "PATH")]
+        config: PathBuf,
+    },
+    RecordCommand {
+        #[arg(long, value_name = "PATH")]
+        config: PathBuf,
+        #[arg(long, value_name = "COMMAND")]
+        command: String,
+    },
 }
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
 
-    let app_config = config::load_from_file(&cli.config)
-        .with_context(|| format!("failed to load config from {}", cli.config.display()))?;
+    match cli.command {
+        Some(Command::RecordSsh {
+            config: config_path,
+        }) => {
+            let app_config = config::load_from_file(&config_path)
+                .with_context(|| format!("failed to load config from {}", config_path.display()))?;
+            let recording_config = app_config
+                .recording
+                .as_ref()
+                .context("recording configuration is required for 'record-ssh'")?;
+            let exit_code = recording::record_ssh(recording_config)?;
+            std::process::exit(exit_code);
+        }
+        Some(Command::RecordCommand {
+            config: config_path,
+            command,
+        }) => {
+            let app_config = config::load_from_file(&config_path)
+                .with_context(|| format!("failed to load config from {}", config_path.display()))?;
+            let recording_config = app_config
+                .recording
+                .as_ref()
+                .context("recording configuration is required for 'record-command'")?;
+            let exit_code = recording::record_command(recording_config, &command)?;
+            std::process::exit(exit_code);
+        }
+        None => {
+            let config_path = cli
+                .config
+                .as_ref()
+                .context("--config is required when running the probe service")?;
+            let app_config = config::load_from_file(config_path)
+                .with_context(|| format!("failed to load config from {}", config_path.display()))?;
+            run_probe_service(app_config).await
+        }
+    }
+}
 
+async fn run_probe_service(app_config: config::AppConfig) -> anyhow::Result<()> {
     let built_probes = probe::build_probes(&app_config.probes)
         .await
         .context("failed to build probes")?;

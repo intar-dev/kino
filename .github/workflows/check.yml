@@ -42,13 +42,15 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y protobuf-compiler
 
-      - name: Run Docker smoke test
+      - name: Run Docker smoke tests
         if: github.event_name == 'pull_request'
         run: just docker-smoke
 
       - name: Print container logs on failure
         if: failure() && github.event_name == 'pull_request'
-        run: docker logs kino-k0s-ci || true
+        run: |
+          docker logs kino-k0s-ci || true
+          docker logs kino-ssh-recording-ci || true
 
   build-static-linux:
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'

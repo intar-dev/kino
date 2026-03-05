@@ -3,7 +3,9 @@ check:
         cargo clippy --workspace --all-targets -- -D warnings -W clippy::pedantic
         cargo nextest run --workspace
 
-docker-smoke:
+docker-smoke: docker-smoke-probes docker-smoke-ssh-recording
+
+docker-smoke-probes:
         #!/usr/bin/env bash
         set -euo pipefail
 
@@ -22,7 +24,16 @@ docker-smoke:
 
           echo "Waiting for /probes readiness..."
           while ((attempts < max_attempts)); do
-            state="$(docker inspect -f '{{{{.State.Status}}}}' "${container_name}" 2>/dev/null || echo unknown)"
+            state="$(
+              docker inspect "${container_name}" 2>/dev/null \
+                | python3 -c 'import json, sys; print(json.load(sys.stdin)[0]["State"]["Status"])' \
+                || echo unknown
+            )"
+            if [[ "${state}" == "unknown" ]]; then
+              echo "Container disappeared before /probes became ready"
+              docker logs --tail 200 "${container_name}" || true
+              return 1
+            fi
             if [[ "${state}" == "exited" || "${state}" == "dead" ]]; then
               echo "Container is ${state} before /probes became ready"
               docker logs --tail 200 "${container_name}" || true
@@ -61,7 +72,7 @@ docker-smoke:
         trap cleanup EXIT
         cleanup
 
-        docker build -t "${image_tag}" .
+        docker build -f docker/smoke/probes.Dockerfile -t "${image_tag}" .
         docker run -d --name "${container_name}" --privileged -p 18080:8080 -p 16443:6443 "${image_tag}" >/dev/null
 
         wait_for_probes
@@ -79,3 +90,106 @@ docker-smoke:
         assert_probe_status "kino_config_exists" "PROBE_STATUS_PASS"
         assert_probe_status "kino_config_has_server_block" "PROBE_STATUS_PASS"
         assert_probe_status "kube_api_port_open" "PROBE_STATUS_PASS"
+
+docker-smoke-ssh-recording:
+        #!/usr/bin/env bash
+        set -euo pipefail
+
+        container_name="kino-ssh-recording-ci"
+        image_tag="kino-ssh-recording:ci"
+        recordings_dir="$(mktemp -d)"
+        ssh_dir="$(mktemp -d)"
+        private_key="${ssh_dir}/id_ed25519"
+        public_key="${ssh_dir}/id_ed25519.pub"
+        interactive_log="${ssh_dir}/interactive.log"
+        command_log="${ssh_dir}/command.log"
+
+        cleanup_container() {
+          docker rm -f "${container_name}" >/dev/null 2>&1 || true
+        }
+
+        cleanup() {
+          cleanup_container
+          rm -rf "${recordings_dir}" "${ssh_dir}"
+        }
+
+        wait_for_ssh() {
+          local attempts=0
+          local max_attempts=60
+          local state
+
+          echo "Waiting for sshd readiness..."
+          while ((attempts < max_attempts)); do
+            state="$(
+              docker inspect "${container_name}" 2>/dev/null \
+                | python3 -c 'import json, sys; print(json.load(sys.stdin)[0]["State"]["Status"])' \
+                || echo unknown
+            )"
+            if [[ "${state}" == "unknown" ]]; then
+              echo "Container disappeared before sshd became ready"
+              docker logs --tail 200 "${container_name}" || true
+              return 1
+            fi
+            if [[ "${state}" == "exited" || "${state}" == "dead" ]]; then
+              echo "Container is ${state} before sshd became ready"
+              docker logs --tail 200 "${container_name}" || true
+              return 1
+            fi
+
+            if ssh -i "${private_key}" \
+              -p 12222 \
+              -o BatchMode=yes \
+              -o ConnectTimeout=2 \
+              -o StrictHostKeyChecking=no \
+              -o UserKnownHostsFile=/dev/null \
+              user@127.0.0.1 "true" >/dev/null 2>&1; then
+              echo "sshd is ready"
+              return 0
+            fi
+
+            ((attempts += 1))
+            sleep 1
+          done
+
+          echo "Timed out waiting for sshd"
+          docker logs --tail 200 "${container_name}" || true
+          return 1
+        }
+
+        trap cleanup EXIT
+        cleanup_container
+
+        chmod 0777 "${recordings_dir}"
+        ssh-keygen -q -N '' -t ed25519 -f "${private_key}"
+
+        docker build -f docker/smoke/ssh-recording.Dockerfile -t "${image_tag}" .
+        docker run -d \
+          --name "${container_name}" \
+          -p 12222:22 \
+          -v "${recordings_dir}:/recordings" \
+          -v "${ssh_dir}:/smoke:ro" \
+          "${image_tag}" >/dev/null
+
+        wait_for_ssh
+
+        printf 'printf "interactive-smoke\\n"\nexit\n' \
+          | ssh -tt \
+              -i "${private_key}" \
+              -p 12222 \
+              -o BatchMode=yes \
+              -o StrictHostKeyChecking=no \
+              -o UserKnownHostsFile=/dev/null \
+              user@127.0.0.1 >"${interactive_log}" 2>&1
+
+        ssh \
+          -i "${private_key}" \
+          -p 12222 \
+          -o BatchMode=yes \
+          -o StrictHostKeyChecking=no \
+          -o UserKnownHostsFile=/dev/null \
+          user@127.0.0.1 "printf 'command-smoke\n'" >"${command_log}" 2>&1
+
+        echo "Recorded files:"
+        ls -la "${recordings_dir}"
+
+        python3 docker/smoke/validate_casts.py "${recordings_dir}"

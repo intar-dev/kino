@@ -11,6 +11,7 @@ use thiserror::Error;
 #[derive(Debug, Clone)]
 pub(crate) struct AppConfig {
     pub(crate) server_bind: ServerBind,
+    pub(crate) recording: Option<RecordingConfig>,
     pub(crate) probes: Vec<ProbeConfig>,
 }
 
@@ -19,6 +20,12 @@ pub(crate) enum ServerBind {
     Tcp(SocketAddr),
     Unix(PathBuf),
     Vsock { cid: u32, port: u32 },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct RecordingConfig {
+    pub(crate) output_dir: PathBuf,
+    pub(crate) real_shell: PathBuf,
 }
 
 #[derive(Debug, Clone)]
@@ -197,6 +204,7 @@ pub(crate) enum DesiredPodStateParseError {
 struct RawConfig {
     server: RawServer,
     defaults: Option<RawDefaults>,
+    recording: Option<RawRecording>,
     #[serde(default)]
     probe: BTreeMap<String, RawProbe>,
 }
@@ -212,6 +220,12 @@ struct RawDefaults {
     timeout_seconds: Option<u64>,
     kubeconfig: Option<PathBuf>,
     kube_context: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct RawRecording {
+    output_dir: PathBuf,
+    real_shell: Option<PathBuf>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -265,6 +279,7 @@ pub(crate) fn load_from_file(path: &Path) -> Result<AppConfig, ConfigError> {
 
     let defaults = normalize_defaults(raw.defaults)?;
     let server_bind = resolve_server_bind(&raw.server)?;
+    let recording = raw.recording.map(build_recording_config).transpose()?;
 
     let probes = raw
         .probe
@@ -274,6 +289,7 @@ pub(crate) fn load_from_file(path: &Path) -> Result<AppConfig, ConfigError> {
 
     Ok(AppConfig {
         server_bind,
+        recording,
         probes,
     })
 }
@@ -373,6 +389,32 @@ fn non_zero_or_default(
 
     NonZeroU64::new(selected).ok_or_else(|| ConfigError::Validation {
         message: format!("{field} must be greater than 0"),
+    })
+}
+
+fn build_recording_config(raw_recording: RawRecording) -> Result<RecordingConfig, ConfigError> {
+    if !raw_recording.output_dir.is_absolute() {
+        return Err(ConfigError::Validation {
+            message: format!(
+                "recording.output_dir '{}' must be an absolute path",
+                raw_recording.output_dir.display()
+            ),
+        });
+    }
+
+    let real_shell = raw_recording
+        .real_shell
+        .unwrap_or_else(|| PathBuf::from("/bin/bash"));
+
+    if real_shell.as_os_str().is_empty() {
+        return Err(ConfigError::Validation {
+            message: "recording.real_shell must not be empty".to_owned(),
+        });
+    }
+
+    Ok(RecordingConfig {
+        output_dir: raw_recording.output_dir,
+        real_shell,
     })
 }
 
@@ -521,6 +563,11 @@ mod tests {
               kubeconfig = "/tmp/kubeconfig"
             }
 
+            recording {
+              output_dir = "/tmp/kino-recordings"
+              real_shell = "/bin/sh"
+            }
+
             probe "hosts" {
               kind = "file_exists"
               path = "/etc/hosts"
@@ -551,6 +598,20 @@ mod tests {
                 panic!("unexpected vsock binding: cid={cid}, port={port}")
             }
         }
+        assert_eq!(
+            config
+                .recording
+                .as_ref()
+                .map(|recording| recording.output_dir.as_path()),
+            Some(std::path::Path::new("/tmp/kino-recordings"))
+        );
+        assert_eq!(
+            config
+                .recording
+                .as_ref()
+                .map(|recording| recording.real_shell.as_path()),
+            Some(std::path::Path::new("/bin/sh"))
+        );
         assert_eq!(config.probes.len(), 2);
     }
 
@@ -654,5 +715,71 @@ mod tests {
     fn rejects_invalid_desired_state_values() {
         let parsed = DesiredPodState::from_str("condition:NotARealState");
         assert!(parsed.is_err());
+    }
+
+    #[test]
+    fn recording_defaults_real_shell() {
+        let temp = tempfile::tempdir();
+        assert!(temp.is_ok());
+        let dir = match temp {
+            Ok(value) => value,
+            Err(error) => panic!("failed to create tempdir: {error}"),
+        };
+
+        let config_path = dir.path().join("kino.hcl");
+        let hcl = r#"
+            server {
+              bind = "tcp://127.0.0.1:9000"
+            }
+
+            recording {
+              output_dir = "/tmp/kino-recordings"
+            }
+        "#;
+
+        let write_result = fs::write(&config_path, hcl);
+        assert!(write_result.is_ok());
+
+        let loaded = load_from_file(&config_path);
+        assert!(loaded.is_ok());
+        let config = match loaded {
+            Ok(value) => value,
+            Err(error) => panic!("failed to parse config: {error}"),
+        };
+
+        assert_eq!(
+            config
+                .recording
+                .as_ref()
+                .map(|recording| recording.real_shell.as_path()),
+            Some(std::path::Path::new("/bin/bash"))
+        );
+    }
+
+    #[test]
+    fn rejects_relative_recording_output_dir() {
+        let temp = tempfile::tempdir();
+        assert!(temp.is_ok());
+        let dir = match temp {
+            Ok(value) => value,
+            Err(error) => panic!("failed to create tempdir: {error}"),
+        };
+
+        let config_path = dir.path().join("kino.hcl");
+        let hcl = r#"
+            server {
+              bind = "tcp://127.0.0.1:9000"
+            }
+
+            recording {
+              output_dir = "relative-recordings"
+            }
+        "#;
+
+        let write_result = fs::write(&config_path, hcl);
+        assert!(write_result.is_ok());
+
+        let loaded = load_from_file(&config_path);
+        assert!(loaded.is_err());
     }
 }
