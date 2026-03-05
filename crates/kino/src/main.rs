@@ -87,6 +87,21 @@ async fn main() -> anyhow::Result<()> {
                 );
             }
         }
+        config::ServerBind::Vsock { cid, port } => {
+            #[cfg(target_os = "linux")]
+            {
+                let listener =
+                    tokio_vsock::VsockListener::bind(tokio_vsock::VsockAddr::new(cid, port))
+                        .with_context(|| format!("failed to bind vsock://{cid}:{port}"))?;
+
+                eprintln!("kino listening on vsock://{cid}:{port}");
+                axum::serve(listener, router).into_future()
+            }
+            #[cfg(not(target_os = "linux"))]
+            {
+                anyhow::bail!("vsock binding is only supported on Linux: vsock://{cid}:{port}");
+            }
+        }
     };
 
     tokio::pin!(server);

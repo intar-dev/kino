@@ -1,7 +1,7 @@
 use serde::Deserialize;
 use std::collections::BTreeMap;
 use std::fs;
-use std::net::{IpAddr, SocketAddr};
+use std::net::SocketAddr;
 use std::num::NonZeroU64;
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
@@ -18,6 +18,7 @@ pub(crate) struct AppConfig {
 pub(crate) enum ServerBind {
     Tcp(SocketAddr),
     Unix(PathBuf),
+    Vsock { cid: u32, port: u32 },
 }
 
 #[derive(Debug, Clone)]
@@ -202,9 +203,7 @@ struct RawConfig {
 
 #[derive(Debug, Deserialize)]
 struct RawServer {
-    bind: Option<String>,
-    port: Option<u16>,
-    unix_socket: Option<PathBuf>,
+    bind: String,
 }
 
 #[derive(Debug, Deserialize, Default)]
@@ -265,7 +264,7 @@ pub(crate) fn load_from_file(path: &Path) -> Result<AppConfig, ConfigError> {
         hcl::from_str(&content).map_err(|source| ConfigError::ParseHcl { source })?;
 
     let defaults = normalize_defaults(raw.defaults)?;
-    let server_bind = resolve_server_bind(raw.server)?;
+    let server_bind = resolve_server_bind(&raw.server)?;
 
     let probes = raw
         .probe
@@ -279,40 +278,75 @@ pub(crate) fn load_from_file(path: &Path) -> Result<AppConfig, ConfigError> {
     })
 }
 
-fn resolve_server_bind(raw_server: RawServer) -> Result<ServerBind, ConfigError> {
-    let has_tcp = raw_server.bind.is_some() || raw_server.port.is_some();
-    let has_unix = raw_server.unix_socket.is_some();
+fn resolve_server_bind(raw_server: &RawServer) -> Result<ServerBind, ConfigError> {
+    parse_server_bind_uri(&raw_server.bind)
+}
 
-    if has_tcp && has_unix {
-        return Err(ConfigError::Validation {
-            message: "server must define either (bind + port) or unix_socket, not both".to_owned(),
-        });
-    }
-
-    if has_unix && let Some(path) = raw_server.unix_socket {
-        return Ok(ServerBind::Unix(path));
-    }
-
-    if !has_tcp {
-        return Err(ConfigError::Validation {
-            message: "server must define either (bind + port) or unix_socket".to_owned(),
-        });
-    }
-
-    let bind = raw_server.bind.ok_or_else(|| ConfigError::Validation {
-        message: "server.bind is required when unix_socket is not set".to_owned(),
-    })?;
-    let port = raw_server.port.ok_or_else(|| ConfigError::Validation {
-        message: "server.port is required when unix_socket is not set".to_owned(),
+fn parse_server_bind_uri(value: &str) -> Result<ServerBind, ConfigError> {
+    let (scheme, address) = value.split_once("://").ok_or_else(|| ConfigError::Validation {
+        message: format!(
+            "server.bind '{value}' must use one of: tcp://<ip:port>, unix://<absolute-path>, vsock://<cid>:<port>"
+        ),
     })?;
 
-    let bind_ip = bind
-        .parse::<IpAddr>()
-        .map_err(|error| ConfigError::Validation {
-            message: format!("server.bind '{bind}' is not a valid IP address: {error}"),
-        })?;
+    match scheme {
+        "tcp" => {
+            let addr = address
+                .parse::<SocketAddr>()
+                .map_err(|error| ConfigError::Validation {
+                    message: format!(
+                        "server.bind '{value}' has invalid tcp address '{address}': {error}"
+                    ),
+                })?;
+            Ok(ServerBind::Tcp(addr))
+        }
+        "unix" => {
+            let path = PathBuf::from(address);
+            if address.is_empty() || !path.is_absolute() {
+                return Err(ConfigError::Validation {
+                    message: format!(
+                        "server.bind '{value}' has invalid unix path; use unix://<absolute-path>"
+                    ),
+                });
+            }
 
-    Ok(ServerBind::Tcp(SocketAddr::new(bind_ip, port)))
+            Ok(ServerBind::Unix(path))
+        }
+        "vsock" => {
+            let (cid, port) = address
+                .split_once(':')
+                .ok_or_else(|| ConfigError::Validation {
+                    message: format!(
+                        "server.bind '{value}' has invalid vsock format; use vsock://<cid>:<port>"
+                    ),
+                })?;
+
+            let parsed_cid = cid
+                .parse::<u32>()
+                .map_err(|error| ConfigError::Validation {
+                    message: format!(
+                        "server.bind '{value}' has invalid vsock cid '{cid}': {error}"
+                    ),
+                })?;
+            let parsed_port = port
+                .parse::<u32>()
+                .map_err(|error| ConfigError::Validation {
+                    message: format!(
+                        "server.bind '{value}' has invalid vsock port '{port}': {error}"
+                    ),
+                })?;
+
+            Ok(ServerBind::Vsock {
+                cid: parsed_cid,
+                port: parsed_port,
+            })
+        }
+        _ => Err(ConfigError::Validation {
+            message: format!(
+                "server.bind '{value}' uses unsupported scheme '{scheme}'; supported: tcp, unix, vsock"
+            ),
+        }),
+    }
 }
 
 fn normalize_defaults(raw_defaults: Option<RawDefaults>) -> Result<EffectiveDefaults, ConfigError> {
@@ -478,8 +512,7 @@ mod tests {
         let config_path = dir.path().join("kino.hcl");
         let hcl = r#"
             server {
-              bind = "127.0.0.1"
-              port = 9000
+              bind = "tcp://127.0.0.1:9000"
             }
 
             defaults {
@@ -514,6 +547,9 @@ mod tests {
         match config.server_bind {
             ServerBind::Tcp(addr) => assert_eq!(addr.port(), 9000),
             ServerBind::Unix(path) => panic!("unexpected unix socket binding: {}", path.display()),
+            ServerBind::Vsock { cid, port } => {
+                panic!("unexpected vsock binding: cid={cid}, port={port}")
+            }
         }
         assert_eq!(config.probes.len(), 2);
     }
@@ -532,7 +568,7 @@ mod tests {
         let hcl = format!(
             r#"
             server {{
-              unix_socket = "{}"
+              bind = "unix://{}"
             }}
         "#,
             socket_path.display()
@@ -551,11 +587,14 @@ mod tests {
         match config.server_bind {
             ServerBind::Unix(path) => assert_eq!(path, socket_path),
             ServerBind::Tcp(addr) => panic!("unexpected tcp binding: {addr}"),
+            ServerBind::Vsock { cid, port } => {
+                panic!("unexpected vsock binding: cid={cid}, port={port}")
+            }
         }
     }
 
     #[test]
-    fn rejects_mixed_tcp_and_unix_server_binding() {
+    fn parses_vsock_server_binding() {
         let temp = tempfile::tempdir();
         assert!(temp.is_ok());
         let dir = match temp {
@@ -566,9 +605,7 @@ mod tests {
         let config_path = dir.path().join("kino.hcl");
         let hcl = r#"
             server {
-              bind = "127.0.0.1"
-              port = 9000
-              unix_socket = "/tmp/kino.sock"
+              bind = "vsock://3:8080"
             }
         "#;
 
@@ -576,11 +613,24 @@ mod tests {
         assert!(write_result.is_ok());
 
         let loaded = load_from_file(&config_path);
-        assert!(loaded.is_err());
+        assert!(loaded.is_ok());
+        let config = match loaded {
+            Ok(value) => value,
+            Err(error) => panic!("failed to parse config: {error}"),
+        };
+
+        match config.server_bind {
+            ServerBind::Vsock { cid, port } => {
+                assert_eq!(cid, 3);
+                assert_eq!(port, 8080);
+            }
+            ServerBind::Tcp(addr) => panic!("unexpected tcp binding: {addr}"),
+            ServerBind::Unix(path) => panic!("unexpected unix binding: {}", path.display()),
+        }
     }
 
     #[test]
-    fn rejects_server_binding_when_missing_tcp_and_unix_values() {
+    fn rejects_server_binding_when_missing_bind() {
         let temp = tempfile::tempdir();
         assert!(temp.is_ok());
         let dir = match temp {

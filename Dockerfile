@@ -20,8 +20,7 @@ RUN set -eu; \
     mkdir -p /etc/kino; \
     { \
       echo 'server {'; \
-      echo '  bind = "0.0.0.0"'; \
-      echo '  port = 8080'; \
+      echo '  bind = "tcp://0.0.0.0:8080"'; \
       echo '}'; \
       echo; \
       echo 'defaults {'; \

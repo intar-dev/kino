@@ -30,3 +30,6 @@ protoc-bin-vendored = "3.2.0"
 [dev-dependencies]
 tempfile = "3.26.0"
 tower = { version = "0.5.3", features = ["util"] }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+tokio-vsock = { version = "0.7.2", features = ["axum08"] }
