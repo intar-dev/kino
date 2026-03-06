@@ -820,6 +820,7 @@ dependencies = [
  "clap",
  "crossterm",
  "hcl-rs",
+ "jsonpath-rust",
  "k8s-openapi",
  "kube",
  "portable-pty",
@@ -1795,6 +1796,7 @@ version = "1.50.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "27ad5e34374e03cfffefc301becb44e9dc3c17584f414349ebe29ed26661822d"
 dependencies = [
+ "bytes",
  "libc",
  "mio",
  "pin-project-lite",

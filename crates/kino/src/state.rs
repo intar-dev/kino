@@ -1,6 +1,6 @@
 use crate::probe::{
-    FileExistsValue, FileRegexCaptureValue, K8sPodStateValue, PortOpenValue, ProbeDefinition,
-    ProbeKind, ProbeStatus, ProbeValue,
+    CommandJsonPathValue, FileExistsValue, FileRegexCaptureValue, K8sPodStateValue, PortOpenValue,
+    ProbeDefinition, ProbeKind, ProbeStatus, ProbeValue,
 };
 use crate::proto::kino_v1;
 use std::collections::BTreeMap;
@@ -103,6 +103,11 @@ impl ProbeStore {
                     ProbeValue::K8sPodState(value) => Some(
                         kino_v1::probe_snapshot::Value::K8sPodState(k8s_pod_state_proto(value)),
                     ),
+                    ProbeValue::CommandJsonPath(value) => {
+                        Some(kino_v1::probe_snapshot::Value::CommandJsonPath(
+                            command_json_path_proto(value),
+                        ))
+                    }
                 };
 
                 kino_v1::ProbeSnapshot {
@@ -145,6 +150,7 @@ fn probe_kind_to_proto(kind: ProbeKind) -> i32 {
         ProbeKind::FileRegexCapture => 2,
         ProbeKind::PortOpen => 3,
         ProbeKind::K8sPodState => 4,
+        ProbeKind::CommandJsonPath => 5,
     }
 }
 
@@ -195,6 +201,19 @@ fn k8s_pod_state_proto(value: &K8sPodStateValue) -> kino_v1::K8sPodStateValue {
         matched_pods: value.matched_pods,
         matching_pod_names: value.matching_pod_names.clone(),
         state_satisfied: value.state_satisfied,
+    }
+}
+
+fn command_json_path_proto(value: &CommandJsonPathValue) -> kino_v1::CommandJsonPathValue {
+    kino_v1::CommandJsonPathValue {
+        argv: value.argv.clone(),
+        json_path: value.json_path.clone(),
+        expected_json: value.expected_json.clone(),
+        matched: value.matched,
+        matched_values: value.matched_values.clone(),
+        stdout: value.stdout.clone(),
+        stderr: value.stderr.clone(),
+        exit_code: value.exit_code,
     }
 }
 

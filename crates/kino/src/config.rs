@@ -1,4 +1,6 @@
+use jsonpath_rust::parser::parse_json_path;
 use serde::Deserialize;
+use serde_json::Value as JsonValue;
 use std::collections::BTreeMap;
 use std::fs;
 use std::net::SocketAddr;
@@ -56,6 +58,11 @@ pub(crate) enum ProbeKindConfig {
         desired_state: DesiredPodState,
         kubeconfig: PathBuf,
         kube_context: Option<String>,
+    },
+    CommandJsonPath {
+        argv: Vec<String>,
+        json_path: String,
+        expected: Option<JsonValue>,
     },
 }
 
@@ -255,6 +262,13 @@ enum RawProbe {
         desired_state: String,
         kubeconfig: Option<PathBuf>,
         kube_context: Option<String>,
+        every_seconds: Option<u64>,
+        timeout_seconds: Option<u64>,
+    },
+    CommandJsonPath {
+        argv: Vec<String>,
+        json_path: String,
+        expected: Option<JsonValue>,
         every_seconds: Option<u64>,
         timeout_seconds: Option<u64>,
     },
@@ -500,6 +514,26 @@ fn build_probe_config(
 
             (every, timeout, kind)
         }
+        RawProbe::CommandJsonPath {
+            argv,
+            json_path,
+            expected,
+            every_seconds,
+            timeout_seconds,
+        } => {
+            let every = every_or_default(every_seconds, defaults.every_seconds, &id)?;
+            let timeout = timeout_or_default(timeout_seconds, defaults.timeout_seconds, &id)?;
+            validate_command_argv(&argv, &id)?;
+            validate_json_path(&json_path, &id)?;
+
+            let kind = ProbeKindConfig::CommandJsonPath {
+                argv,
+                json_path,
+                expected,
+            };
+
+            (every, timeout, kind)
+        }
     };
 
     Ok(ProbeConfig {
@@ -521,6 +555,38 @@ fn every_or_default(
     })?;
 
     Ok(Duration::from_secs(non_zero.get()))
+}
+
+fn validate_command_argv(argv: &[String], probe_id: &str) -> Result<(), ConfigError> {
+    if argv.is_empty() {
+        return Err(ConfigError::Validation {
+            message: format!("probe '{probe_id}' kind 'command_json_path' requires argv"),
+        });
+    }
+
+    if argv.iter().any(String::is_empty) {
+        return Err(ConfigError::Validation {
+            message: format!("probe '{probe_id}' kind 'command_json_path' has an empty argv item"),
+        });
+    }
+
+    Ok(())
+}
+
+fn validate_json_path(json_path: &str, probe_id: &str) -> Result<(), ConfigError> {
+    if json_path.trim().is_empty() {
+        return Err(ConfigError::Validation {
+            message: format!("probe '{probe_id}' kind 'command_json_path' requires json_path"),
+        });
+    }
+
+    parse_json_path(json_path).map_err(|error| ConfigError::Validation {
+        message: format!(
+            "probe '{probe_id}' kind 'command_json_path' has invalid json_path '{json_path}': {error}"
+        ),
+    })?;
+
+    Ok(())
 }
 
 fn timeout_or_default(
@@ -579,6 +645,13 @@ mod tests {
               port = 22
               protocol = "tcp"
             }
+
+            probe "netbird_ssh" {
+              kind = "command_json_path"
+              argv = ["netbird", "status", "--json"]
+              json_path = "$.sshServer.enabled"
+              expected = true
+            }
         "#;
 
         let write_result = fs::write(&config_path, hcl);
@@ -612,7 +685,7 @@ mod tests {
                 .map(|recording| recording.real_shell.as_path()),
             Some(std::path::Path::new("/bin/sh"))
         );
-        assert_eq!(config.probes.len(), 2);
+        assert_eq!(config.probes.len(), 3);
     }
 
     #[test]
@@ -773,6 +846,94 @@ mod tests {
 
             recording {
               output_dir = "relative-recordings"
+            }
+        "#;
+
+        let write_result = fs::write(&config_path, hcl);
+        assert!(write_result.is_ok());
+
+        let loaded = load_from_file(&config_path);
+        assert!(loaded.is_err());
+    }
+
+    #[test]
+    fn rejects_command_json_path_without_argv() {
+        let temp = tempfile::tempdir();
+        assert!(temp.is_ok());
+        let dir = match temp {
+            Ok(value) => value,
+            Err(error) => panic!("failed to create tempdir: {error}"),
+        };
+
+        let config_path = dir.path().join("kino.hcl");
+        let hcl = r#"
+            server {
+              bind = "tcp://127.0.0.1:9000"
+            }
+
+            probe "netbird" {
+              kind = "command_json_path"
+              argv = []
+              json_path = "$.sshServer.enabled"
+              expected = true
+            }
+        "#;
+
+        let write_result = fs::write(&config_path, hcl);
+        assert!(write_result.is_ok());
+
+        let loaded = load_from_file(&config_path);
+        assert!(loaded.is_err());
+    }
+
+    #[test]
+    fn rejects_command_json_path_without_json_path() {
+        let temp = tempfile::tempdir();
+        assert!(temp.is_ok());
+        let dir = match temp {
+            Ok(value) => value,
+            Err(error) => panic!("failed to create tempdir: {error}"),
+        };
+
+        let config_path = dir.path().join("kino.hcl");
+        let hcl = r#"
+            server {
+              bind = "tcp://127.0.0.1:9000"
+            }
+
+            probe "netbird" {
+              kind = "command_json_path"
+              argv = ["netbird", "status", "--json"]
+              json_path = "   "
+            }
+        "#;
+
+        let write_result = fs::write(&config_path, hcl);
+        assert!(write_result.is_ok());
+
+        let loaded = load_from_file(&config_path);
+        assert!(loaded.is_err());
+    }
+
+    #[test]
+    fn rejects_command_json_path_with_invalid_json_path() {
+        let temp = tempfile::tempdir();
+        assert!(temp.is_ok());
+        let dir = match temp {
+            Ok(value) => value,
+            Err(error) => panic!("failed to create tempdir: {error}"),
+        };
+
+        let config_path = dir.path().join("kino.hcl");
+        let hcl = r#"
+            server {
+              bind = "tcp://127.0.0.1:9000"
+            }
+
+            probe "netbird" {
+              kind = "command_json_path"
+              argv = ["netbird", "status", "--json"]
+              json_path = "$["
             }
         "#;
 

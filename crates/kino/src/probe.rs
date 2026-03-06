@@ -1,14 +1,17 @@
 use crate::config::{
     DesiredPodState, PodCondition, PodPhase, PortProtocol, ProbeConfig, ProbeKindConfig,
 };
+use jsonpath_rust::JsonPath;
 use k8s_openapi::api::core::v1::Pod;
 use kube::api::ListParams;
 use kube::config::{KubeConfigOptions, Kubeconfig};
 use kube::{Api, Client, Config as KubeClientConfig};
 use regex::Regex;
+use serde_json::Value as JsonValue;
 use std::path::Path;
 use std::time::Duration;
 use thiserror::Error;
+use tokio::process::Command;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ProbeKind {
@@ -16,6 +19,7 @@ pub(crate) enum ProbeKind {
     FileRegexCapture,
     PortOpen,
     K8sPodState,
+    CommandJsonPath,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -66,6 +70,7 @@ pub(crate) enum ProbeValue {
     FileRegexCapture(FileRegexCaptureValue),
     PortOpen(PortOpenValue),
     K8sPodState(K8sPodStateValue),
+    CommandJsonPath(CommandJsonPathValue),
 }
 
 #[derive(Debug, Clone)]
@@ -101,6 +106,18 @@ pub(crate) struct K8sPodStateValue {
     pub(crate) matched_pods: u32,
     pub(crate) matching_pod_names: Vec<String>,
     pub(crate) state_satisfied: bool,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct CommandJsonPathValue {
+    pub(crate) argv: Vec<String>,
+    pub(crate) json_path: String,
+    pub(crate) expected_json: String,
+    pub(crate) matched: bool,
+    pub(crate) matched_values: Vec<String>,
+    pub(crate) stdout: String,
+    pub(crate) stderr: String,
+    pub(crate) exit_code: i32,
 }
 
 #[derive(Debug)]
@@ -142,6 +159,7 @@ enum ProbeRunner {
     FileRegexCapture(FileRegexCaptureProbe),
     PortOpen(PortOpenProbe),
     K8sPodState(K8sPodStateProbe),
+    CommandJsonPath(CommandJsonPathProbe),
 }
 
 impl ProbeRunner {
@@ -174,6 +192,19 @@ impl ProbeRunner {
                 matching_pod_names: Vec::new(),
                 state_satisfied: false,
             }),
+            Self::CommandJsonPath(probe) => ProbeValue::CommandJsonPath(CommandJsonPathValue {
+                argv: probe.argv.clone(),
+                json_path: probe.json_path.clone(),
+                expected_json: probe
+                    .expected
+                    .as_ref()
+                    .map_or_else(String::new, json_value_string),
+                matched: false,
+                matched_values: Vec::new(),
+                stdout: String::new(),
+                stderr: String::new(),
+                exit_code: 0,
+            }),
         }
     }
 
@@ -183,6 +214,7 @@ impl ProbeRunner {
             Self::FileRegexCapture(probe) => probe.run().await,
             Self::PortOpen(probe) => probe.run().await,
             Self::K8sPodState(probe) => probe.run().await,
+            Self::CommandJsonPath(probe) => probe.run().await,
         }
     }
 }
@@ -463,6 +495,112 @@ impl K8sPodStateProbe {
     }
 }
 
+#[derive(Debug, Clone)]
+struct CommandJsonPathProbe {
+    argv: Vec<String>,
+    json_path: String,
+    expected: Option<JsonValue>,
+}
+
+impl CommandJsonPathProbe {
+    async fn run(&self) -> ProbeRunResult {
+        let output = match Command::new(&self.argv[0])
+            .args(&self.argv[1..])
+            .output()
+            .await
+        {
+            Ok(value) => value,
+            Err(error) => {
+                return ProbeRunResult {
+                    status: ProbeStatus::Fail,
+                    value: ProbeValue::CommandJsonPath(self.value(
+                        String::new(),
+                        String::new(),
+                        -1,
+                    )),
+                    error: Some(error.to_string()),
+                };
+            }
+        };
+
+        let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
+        let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+        let exit_code = output.status.code().unwrap_or(-1);
+        let mut value = self.value(stdout.clone(), stderr.clone(), exit_code);
+
+        if !output.status.success() {
+            return ProbeRunResult {
+                status: ProbeStatus::Fail,
+                value: ProbeValue::CommandJsonPath(value),
+                error: Some(format!("command exited with status {}", output.status)),
+            };
+        }
+
+        let json = match serde_json::from_slice::<JsonValue>(&output.stdout) {
+            Ok(value) => value,
+            Err(error) => {
+                return ProbeRunResult {
+                    status: ProbeStatus::Fail,
+                    value: ProbeValue::CommandJsonPath(value),
+                    error: Some(format!("failed to parse stdout as JSON: {error}")),
+                };
+            }
+        };
+
+        let matches = match json.query(&self.json_path) {
+            Ok(value) => value,
+            Err(error) => {
+                return ProbeRunResult {
+                    status: ProbeStatus::Fail,
+                    value: ProbeValue::CommandJsonPath(value),
+                    error: Some(format!(
+                        "failed to evaluate json_path '{}': {error}",
+                        self.json_path
+                    )),
+                };
+            }
+        };
+
+        value.matched_values = matches
+            .iter()
+            .map(|matched| json_value_string(matched))
+            .collect::<Vec<_>>();
+        value.matched = if let Some(expected) = &self.expected {
+            matches.contains(&expected)
+        } else {
+            !matches.is_empty()
+        };
+
+        let status = if value.matched {
+            ProbeStatus::Pass
+        } else {
+            ProbeStatus::Fail
+        };
+
+        ProbeRunResult {
+            status,
+            value: ProbeValue::CommandJsonPath(value),
+            error: None,
+        }
+    }
+
+    fn value(&self, stdout: String, stderr: String, exit_code: i32) -> CommandJsonPathValue {
+        CommandJsonPathValue {
+            argv: self.argv.clone(),
+            json_path: self.json_path.clone(),
+            expected_json: self
+                .expected
+                .as_ref()
+                .map_or_else(String::new, json_value_string),
+            matched: false,
+            matched_values: Vec::new(),
+            stdout,
+            stderr,
+            exit_code,
+        }
+    }
+}
+
 fn pod_matches_desired_state(desired_state: &DesiredPodState, pod: &Pod) -> bool {
     match desired_state {
         DesiredPodState::Phase(expected_phase) => pod_matches_phase(*expected_phase, pod),
@@ -507,6 +645,10 @@ fn pod_matches_condition(expected_condition: PodCondition, pod: &Pod) -> bool {
 
 fn path_string(path: &Path) -> String {
     path.to_string_lossy().into_owned()
+}
+
+fn json_value_string(value: &JsonValue) -> String {
+    value.to_string()
 }
 
 fn pod_name(pod: &Pod) -> String {
@@ -591,6 +733,21 @@ pub(crate) async fn build_probes(
                     }),
                 }
             }
+            ProbeKindConfig::CommandJsonPath {
+                argv,
+                json_path,
+                expected,
+            } => ProbeDefinition {
+                id: config.id.clone(),
+                kind: ProbeKind::CommandJsonPath,
+                every: config.every,
+                timeout: config.timeout,
+                runner: ProbeRunner::CommandJsonPath(CommandJsonPathProbe {
+                    argv: argv.clone(),
+                    json_path: json_path.clone(),
+                    expected: expected.clone(),
+                }),
+            },
         };
 
         probes.push(probe);
@@ -633,12 +790,13 @@ async fn kube_client(
 #[cfg(test)]
 mod tests {
     use super::{
-        FileRegexCaptureProbe, PortOpenProbe, ProbeStatus, ProbeValue, pod_matches_condition,
-        pod_matches_phase,
+        CommandJsonPathProbe, FileRegexCaptureProbe, PortOpenProbe, ProbeStatus, ProbeValue,
+        pod_matches_condition, pod_matches_phase,
     };
     use crate::config::{PodCondition, PodPhase, PortProtocol};
     use k8s_openapi::api::core::v1::{Pod, PodCondition as K8sPodCondition, PodStatus};
     use k8s_openapi::apimachinery::pkg::apis::meta::v1::ObjectMeta;
+    use serde_json::json;
     use std::fs;
 
     #[tokio::test]
@@ -710,6 +868,197 @@ mod tests {
             ProbeValue::PortOpen(value) => {
                 assert!(value.open);
                 assert_eq!(value.port, port);
+            }
+            _ => panic!("unexpected probe value type"),
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn command_json_path_probe_matches_expected_value() {
+        let temp = tempfile::tempdir();
+        assert!(temp.is_ok());
+        let dir = match temp {
+            Ok(value) => value,
+            Err(error) => panic!("failed to create tempdir: {error}"),
+        };
+
+        let file_path = dir.path().join("netbird-status.json");
+        let write_result = fs::write(
+            &file_path,
+            r#"{"peers":{"connected":1},"sshServer":{"enabled":true}}"#,
+        );
+        assert!(write_result.is_ok());
+
+        let probe = CommandJsonPathProbe {
+            argv: vec![
+                "/bin/cat".to_owned(),
+                file_path.to_string_lossy().into_owned(),
+            ],
+            json_path: "$.sshServer.enabled".to_owned(),
+            expected: Some(json!(true)),
+        };
+
+        let result = probe.run().await;
+        assert_eq!(result.status, ProbeStatus::Pass);
+
+        match result.value {
+            ProbeValue::CommandJsonPath(value) => {
+                assert!(value.matched);
+                assert_eq!(value.matched_values, vec!["true".to_owned()]);
+                assert_eq!(value.expected_json, "true");
+            }
+            _ => panic!("unexpected probe value type"),
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn command_json_path_probe_passes_when_path_exists() {
+        let temp = tempfile::tempdir();
+        assert!(temp.is_ok());
+        let dir = match temp {
+            Ok(value) => value,
+            Err(error) => panic!("failed to create tempdir: {error}"),
+        };
+
+        let file_path = dir.path().join("netbird-status.json");
+        let write_result = fs::write(
+            &file_path,
+            r#"{"sshServer":{"sessions":[{"remoteAddress":"10.48.162.109:39148"}]}}"#,
+        );
+        assert!(write_result.is_ok());
+
+        let probe = CommandJsonPathProbe {
+            argv: vec![
+                "/bin/cat".to_owned(),
+                file_path.to_string_lossy().into_owned(),
+            ],
+            json_path: "$.sshServer.sessions[*].remoteAddress".to_owned(),
+            expected: None,
+        };
+
+        let result = probe.run().await;
+        assert_eq!(result.status, ProbeStatus::Pass);
+
+        match result.value {
+            ProbeValue::CommandJsonPath(value) => {
+                assert!(value.matched);
+                assert_eq!(
+                    value.matched_values,
+                    vec!["\"10.48.162.109:39148\"".to_owned()]
+                );
+            }
+            _ => panic!("unexpected probe value type"),
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn command_json_path_probe_fails_when_expected_value_is_missing() {
+        let temp = tempfile::tempdir();
+        assert!(temp.is_ok());
+        let dir = match temp {
+            Ok(value) => value,
+            Err(error) => panic!("failed to create tempdir: {error}"),
+        };
+
+        let file_path = dir.path().join("netbird-status.json");
+        let write_result = fs::write(&file_path, r#"{"sshServer":{"enabled":false}}"#);
+        assert!(write_result.is_ok());
+
+        let probe = CommandJsonPathProbe {
+            argv: vec![
+                "/bin/cat".to_owned(),
+                file_path.to_string_lossy().into_owned(),
+            ],
+            json_path: "$.sshServer.enabled".to_owned(),
+            expected: Some(json!(true)),
+        };
+
+        let result = probe.run().await;
+        assert_eq!(result.status, ProbeStatus::Fail);
+        assert!(result.error.is_none());
+
+        match result.value {
+            ProbeValue::CommandJsonPath(value) => {
+                assert!(!value.matched);
+                assert_eq!(value.matched_values, vec!["false".to_owned()]);
+                assert_eq!(value.expected_json, "true");
+            }
+            _ => panic!("unexpected probe value type"),
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn command_json_path_probe_fails_when_stdout_is_not_json() {
+        let temp = tempfile::tempdir();
+        assert!(temp.is_ok());
+        let dir = match temp {
+            Ok(value) => value,
+            Err(error) => panic!("failed to create tempdir: {error}"),
+        };
+
+        let file_path = dir.path().join("not-json.txt");
+        let write_result = fs::write(&file_path, "definitely not json");
+        assert!(write_result.is_ok());
+
+        let probe = CommandJsonPathProbe {
+            argv: vec![
+                "/bin/cat".to_owned(),
+                file_path.to_string_lossy().into_owned(),
+            ],
+            json_path: "$.sshServer.enabled".to_owned(),
+            expected: Some(json!(true)),
+        };
+
+        let result = probe.run().await;
+        assert_eq!(result.status, ProbeStatus::Fail);
+        assert!(
+            result
+                .error
+                .as_deref()
+                .is_some_and(|error| error.contains("failed to parse stdout as JSON"))
+        );
+
+        match result.value {
+            ProbeValue::CommandJsonPath(value) => {
+                assert!(!value.matched);
+                assert_eq!(value.stdout, "definitely not json");
+                assert_eq!(value.exit_code, 0);
+            }
+            _ => panic!("unexpected probe value type"),
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn command_json_path_probe_fails_when_command_exits_non_zero() {
+        let probe = CommandJsonPathProbe {
+            argv: vec![
+                "/bin/sh".to_owned(),
+                "-c".to_owned(),
+                "printf '{\"sshServer\":{\"enabled\":true}}'; exit 7".to_owned(),
+            ],
+            json_path: "$.sshServer.enabled".to_owned(),
+            expected: Some(json!(true)),
+        };
+
+        let result = probe.run().await;
+        assert_eq!(result.status, ProbeStatus::Fail);
+        assert!(
+            result
+                .error
+                .as_deref()
+                .is_some_and(|error| error.contains("command exited with status"))
+        );
+
+        match result.value {
+            ProbeValue::CommandJsonPath(value) => {
+                assert!(!value.matched);
+                assert_eq!(value.stdout, "{\"sshServer\":{\"enabled\":true}}");
+                assert_eq!(value.exit_code, 7);
             }
             _ => panic!("unexpected probe value type"),
         }

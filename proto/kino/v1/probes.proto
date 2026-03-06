@@ -8,6 +8,7 @@ enum ProbeKind {
   PROBE_KIND_FILE_REGEX_CAPTURE = 2;
   PROBE_KIND_PORT_OPEN = 3;
   PROBE_KIND_K8S_POD_STATE = 4;
+  PROBE_KIND_COMMAND_JSON_PATH = 5;
 }
 
 enum ProbeStatus {
@@ -36,6 +37,7 @@ message ProbeSnapshot {
     FileRegexCaptureValue file_regex_capture = 21;
     PortOpenValue port_open = 22;
     K8sPodStateValue k8s_pod_state = 23;
+    CommandJsonPathValue command_json_path = 24;
   }
 }
 
@@ -68,4 +70,15 @@ message K8sPodStateValue {
   uint32 matched_pods = 4;
   repeated string matching_pod_names = 5;
   bool state_satisfied = 6;
+}
+
+message CommandJsonPathValue {
+  repeated string argv = 1;
+  string json_path = 2;
+  string expected_json = 3;
+  bool matched = 4;
+  repeated string matched_values = 5;
+  string stdout = 6;
+  string stderr = 7;
+  int32 exit_code = 8;
 }
