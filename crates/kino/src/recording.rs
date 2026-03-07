@@ -20,6 +20,7 @@ mod imp {
 
     const DEFAULT_TTY_WIDTH: u16 = 80;
     const DEFAULT_TTY_HEIGHT: u16 = 24;
+    const CAST_SYNC_INTERVAL_MS: u64 = 250;
 
     #[derive(Debug, Serialize)]
     struct CastHeader {
@@ -42,6 +43,7 @@ mod imp {
     struct CastWriter {
         file: File,
         start_ts_unix_ms: u64,
+        last_sync_ts_unix_ms: u64,
     }
 
     impl CastWriter {
@@ -58,6 +60,7 @@ mod imp {
             let mut writer = Self {
                 file,
                 start_ts_unix_ms,
+                last_sync_ts_unix_ms: start_ts_unix_ms,
             };
 
             let header = CastHeader {
@@ -89,7 +92,7 @@ mod imp {
         }
 
         fn finish(&mut self) -> io::Result<()> {
-            self.file.flush()
+            self.file.sync_all()
         }
 
         fn write_event(
@@ -104,6 +107,16 @@ mod imp {
             let line = serde_json::to_string(&(rel, kind, data)).map_err(io::Error::other)?;
             self.file.write_all(line.as_bytes())?;
             self.file.write_all(b"\n")?;
+            self.sync_data_if_due(ts_unix_ms)?;
+            Ok(())
+        }
+
+        fn sync_data_if_due(&mut self, ts_unix_ms: u64) -> io::Result<()> {
+            if ts_unix_ms.saturating_sub(self.last_sync_ts_unix_ms) < CAST_SYNC_INTERVAL_MS {
+                return Ok(());
+            }
+            self.file.sync_data()?;
+            self.last_sync_ts_unix_ms = ts_unix_ms;
             Ok(())
         }
     }
