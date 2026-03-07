@@ -103,6 +103,8 @@ docker-smoke-ssh-recording:
         public_key="${ssh_dir}/id_ed25519.pub"
         interactive_log="${ssh_dir}/interactive.log"
         command_log="${ssh_dir}/command.log"
+        tty_command_log="${ssh_dir}/tty-command.log"
+        stdin_command_log="${ssh_dir}/stdin-command.log"
 
         cleanup_container() {
           docker rm -f "${container_name}" >/dev/null 2>&1 || true
@@ -188,6 +190,23 @@ docker-smoke-ssh-recording:
           -o StrictHostKeyChecking=no \
           -o UserKnownHostsFile=/dev/null \
           user@127.0.0.1 "printf 'command-smoke\n'" >"${command_log}" 2>&1
+
+        ssh -tt \
+          -i "${private_key}" \
+          -p 12222 \
+          -o BatchMode=yes \
+          -o StrictHostKeyChecking=no \
+          -o UserKnownHostsFile=/dev/null \
+          user@127.0.0.1 "printf 'tty-command-smoke\n'" >"${tty_command_log}" 2>&1
+
+        printf 'stdin-smoke\n' \
+          | ssh \
+              -i "${private_key}" \
+              -p 12222 \
+              -o BatchMode=yes \
+              -o StrictHostKeyChecking=no \
+              -o UserKnownHostsFile=/dev/null \
+              user@127.0.0.1 "cat >/tmp/stdin-smoke && cat /tmp/stdin-smoke" >"${stdin_command_log}" 2>&1
 
         echo "Recorded files:"
         ls -la "${recordings_dir}"

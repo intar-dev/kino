@@ -28,6 +28,8 @@ enum Command {
     RecordSsh {
         #[arg(long, value_name = "PATH")]
         config: PathBuf,
+        #[arg(long, value_name = "COMMAND")]
+        command: Option<String>,
     },
     RecordCommand {
         #[arg(long, value_name = "PATH")]
@@ -44,6 +46,7 @@ async fn main() -> anyhow::Result<()> {
     match cli.command {
         Some(Command::RecordSsh {
             config: config_path,
+            command,
         }) => {
             let app_config = config::load_from_file(&config_path)
                 .with_context(|| format!("failed to load config from {}", config_path.display()))?;
@@ -51,7 +54,7 @@ async fn main() -> anyhow::Result<()> {
                 .recording
                 .as_ref()
                 .context("recording configuration is required for 'record-ssh'")?;
-            let exit_code = recording::record_ssh(recording_config)?;
+            let exit_code = recording::record_ssh(recording_config, command.as_deref())?;
             std::process::exit(exit_code);
         }
         Some(Command::RecordCommand {

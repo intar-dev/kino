@@ -6,8 +6,8 @@ import sys
 def main() -> None:
     recordings_dir = pathlib.Path(sys.argv[1])
     files = sorted(recordings_dir.glob("*.cast"))
-    if len(files) < 2:
-        raise SystemExit(f"expected at least 2 cast files, found {len(files)}")
+    if len(files) < 4:
+        raise SystemExit(f"expected at least 4 cast files, found {len(files)}")
 
     all_payloads: list[str] = []
     for path in files:
@@ -22,6 +22,8 @@ def main() -> None:
             header.get("height"), int
         ):
             raise SystemExit(f"{path.name} has invalid dimensions: {header!r}")
+        if header["width"] <= 0 or header["height"] <= 0:
+            raise SystemExit(f"{path.name} has non-positive dimensions: {header!r}")
         if "env" not in header or "SHELL" not in header["env"]:
             raise SystemExit(f"{path.name} is missing env.SHELL: {header!r}")
 
@@ -42,6 +44,10 @@ def main() -> None:
         raise SystemExit("interactive session payload missing from cast files")
     if "command-smoke" not in joined:
         raise SystemExit("command session payload missing from cast files")
+    if "tty-command-smoke" not in joined:
+        raise SystemExit("tty command payload missing from cast files")
+    if "stdin-smoke" not in joined:
+        raise SystemExit("stdin-fed command payload missing from cast files")
 
 
 if __name__ == "__main__":

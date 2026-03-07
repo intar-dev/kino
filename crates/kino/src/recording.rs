@@ -14,7 +14,7 @@ mod imp {
     use std::io::ErrorKind;
     use std::io::{self, IsTerminal, Read, Write};
     use std::path::{Path, PathBuf};
-    use std::process::{Command, Stdio};
+    use std::process::{ChildStdin, Command, Stdio};
     use std::sync::mpsc;
     use std::sync::{Arc, Mutex};
     use std::thread;
@@ -275,10 +275,10 @@ mod imp {
 
     pub(crate) fn record_command(config: &RecordingConfig, command: &str) -> Result<i32> {
         let start_ts_unix_ms = unix_ms();
-        let (width, height) = terminal::size().unwrap_or((DEFAULT_TTY_WIDTH, DEFAULT_TTY_HEIGHT));
+        let (width, height) = tty_dimensions();
         let metadata =
             build_cast_metadata(config, (!command.is_empty()).then(|| command.to_owned()));
-        let (mut writer, cast_path) = CastWriter::start(
+        let (writer, cast_path) = CastWriter::start(
             &config.output_dir,
             start_ts_unix_ms,
             width,
@@ -292,44 +292,55 @@ mod imp {
             )
         })?;
 
-        write_command_input_event(&mut writer, &cast_path, command)?;
+        let shared_writer = Arc::new(Mutex::new(writer));
+        write_command_input_event(&shared_writer, &cast_path, command)?;
 
         let mut child = spawn_recorded_command(&config.real_shell, command)?;
-        let CommandOutputCapture {
+        let CommandIoCapture {
             rx,
             stdout_handle,
             stderr_handle,
+            input_error,
             stdout_error,
             stderr_error,
-        } = start_command_output_capture(&mut child)?;
+        } = start_command_io_capture(&mut child, Arc::clone(&shared_writer))?;
 
-        forward_and_record_command_output(&mut writer, &cast_path, rx)?;
+        forward_and_record_command_output(&shared_writer, &cast_path, rx)?;
         finalize_command_output_capture(
             stdout_handle,
             stderr_handle,
+            &input_error,
             &stdout_error,
             &stderr_error,
         )?;
 
         let exit_code = wait_for_command_exit(&mut child)?;
 
-        writer
-            .finish(unix_ms())
-            .with_context(|| format!("failed to flush cast file {}", cast_path.display()))?;
+        {
+            let mut writer = shared_writer
+                .lock()
+                .map_err(|_| anyhow!("cast writer lock poisoned"))?;
+            writer
+                .finish(unix_ms())
+                .with_context(|| format!("failed to flush cast file {}", cast_path.display()))?;
+        }
 
         Ok(exit_code)
     }
 
-    pub(crate) fn record_ssh(config: &RecordingConfig) -> Result<i32> {
+    pub(crate) fn record_ssh(config: &RecordingConfig, command: Option<&str>) -> Result<i32> {
         ensure_interactive_tty()?;
 
         let (width, height) = tty_dimensions();
         let (shared_writer, cast_path, _raw_mode) =
-            prepare_interactive_writer(config, width, height)?;
+            prepare_interactive_writer(config, width, height, command)?;
+        if let Some(command) = command {
+            write_command_input_event(&shared_writer, &cast_path, command)?;
+        }
         let input_error = Arc::new(Mutex::new(None::<String>));
         let resize_error = Arc::new(Mutex::new(None::<String>));
         let (child, pty_reader, pty_writer, pty_master, slave_keepalive) =
-            start_login_shell(&config.real_shell, width, height)?;
+            start_login_shell(&config.real_shell, width, height, command)?;
         let mut child_killer = child.clone_killer();
 
         spawn_input_forwarder(
@@ -386,18 +397,24 @@ mod imp {
     }
 
     fn tty_dimensions() -> (u16, u16) {
-        terminal::size().unwrap_or((DEFAULT_TTY_WIDTH, DEFAULT_TTY_HEIGHT))
+        match terminal::size() {
+            Ok((width, height)) if width > 0 && height > 0 => (width, height),
+            _ => (DEFAULT_TTY_WIDTH, DEFAULT_TTY_HEIGHT),
+        }
     }
 
     fn prepare_interactive_writer(
         config: &RecordingConfig,
         width: u16,
         height: u16,
+        command: Option<&str>,
     ) -> Result<(Arc<Mutex<CastWriter>>, PathBuf, RawModeGuard)> {
         let start_ts_unix_ms = unix_ms();
         let metadata = build_cast_metadata(
             config,
-            Some(config.real_shell.to_string_lossy().into_owned()),
+            command
+                .map(str::to_owned)
+                .or_else(|| Some(config.real_shell.to_string_lossy().into_owned())),
         );
         let (writer, cast_path) = CastWriter::start(
             &config.output_dir,
@@ -428,10 +445,11 @@ mod imp {
         Stderr,
     }
 
-    struct CommandOutputCapture {
+    struct CommandIoCapture {
         rx: mpsc::Receiver<CommandOutputChunk>,
         stdout_handle: thread::JoinHandle<()>,
         stderr_handle: thread::JoinHandle<()>,
+        input_error: Arc<Mutex<Option<String>>>,
         stdout_error: Arc<Mutex<Option<String>>>,
         stderr_error: Arc<Mutex<Option<String>>>,
     }
@@ -443,7 +461,7 @@ mod imp {
     }
 
     fn write_command_input_event(
-        writer: &mut CastWriter,
+        writer: &Arc<Mutex<CastWriter>>,
         cast_path: &Path,
         command: &str,
     ) -> Result<()> {
@@ -453,23 +471,28 @@ mod imp {
 
         let mut input = command.to_owned();
         input.push('\n');
-        writer
-            .write_input_bytes(unix_ms(), input.as_bytes())
+        write_cast_chunk(writer, unix_ms(), "i", input.as_bytes())
             .with_context(|| format!("failed to write input event to {}", cast_path.display()))
     }
 
     fn spawn_recorded_command(real_shell: &Path, command: &str) -> Result<std::process::Child> {
         Command::new(real_shell)
             .args(["-c", command])
+            .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .spawn()
             .with_context(|| format!("failed to run shell command via {}", real_shell.display()))
     }
 
-    fn start_command_output_capture(
+    fn start_command_io_capture(
         child: &mut std::process::Child,
-    ) -> Result<CommandOutputCapture> {
+        writer: Arc<Mutex<CastWriter>>,
+    ) -> Result<CommandIoCapture> {
+        let stdin = child
+            .stdin
+            .take()
+            .ok_or_else(|| anyhow!("failed to capture command stdin"))?;
         let stdout = child
             .stdout
             .take()
@@ -480,8 +503,10 @@ mod imp {
             .ok_or_else(|| anyhow!("failed to capture command stderr"))?;
 
         let (tx, rx) = mpsc::channel::<CommandOutputChunk>();
+        let input_error = Arc::new(Mutex::new(None::<String>));
         let stdout_error = Arc::new(Mutex::new(None::<String>));
         let stderr_error = Arc::new(Mutex::new(None::<String>));
+        spawn_command_input_forwarder(stdin, writer, Arc::clone(&input_error));
         let stdout_handle = spawn_command_output_forwarder(
             stdout,
             CommandOutputStream::Stdout,
@@ -495,17 +520,18 @@ mod imp {
             Arc::clone(&stderr_error),
         );
 
-        Ok(CommandOutputCapture {
+        Ok(CommandIoCapture {
             rx,
             stdout_handle,
             stderr_handle,
+            input_error,
             stdout_error,
             stderr_error,
         })
     }
 
     fn forward_and_record_command_output(
-        writer: &mut CastWriter,
+        writer: &Arc<Mutex<CastWriter>>,
         cast_path: &Path,
         rx: mpsc::Receiver<CommandOutputChunk>,
     ) -> Result<()> {
@@ -532,14 +558,12 @@ mod imp {
                 }
             }
 
-            writer
-                .write_output_bytes(chunk.ts_unix_ms, &chunk.bytes)
-                .with_context(|| {
-                    format!(
-                        "failed to write command output event to {}",
-                        cast_path.display()
-                    )
-                })?;
+            write_cast_chunk(writer, chunk.ts_unix_ms, "o", &chunk.bytes).with_context(|| {
+                format!(
+                    "failed to write command output event to {}",
+                    cast_path.display()
+                )
+            })?;
         }
 
         Ok(())
@@ -548,12 +572,16 @@ mod imp {
     fn finalize_command_output_capture(
         stdout_handle: thread::JoinHandle<()>,
         stderr_handle: thread::JoinHandle<()>,
+        input_error: &Arc<Mutex<Option<String>>>,
         stdout_error: &Arc<Mutex<Option<String>>>,
         stderr_error: &Arc<Mutex<Option<String>>>,
     ) -> Result<()> {
         join_command_output_forwarder(stdout_handle)?;
         join_command_output_forwarder(stderr_handle)?;
 
+        if let Some(message) = take_thread_error(input_error) {
+            return Err(anyhow!(message));
+        }
         if let Some(message) = take_thread_error(stdout_error) {
             return Err(anyhow!(message));
         }
@@ -576,6 +604,7 @@ mod imp {
         real_shell: &Path,
         width: u16,
         height: u16,
+        command: Option<&str>,
     ) -> Result<(PtyChild, PtyReader, PtyWriter, PtyMaster, Option<File>)> {
         let pty_system = native_pty_system();
         let pair = pty_system
@@ -587,12 +616,17 @@ mod imp {
             })
             .context("failed to allocate PTY")?;
 
-        let mut command = CommandBuilder::new(real_shell.to_string_lossy().into_owned());
-        command.arg("-l");
+        let mut builder = CommandBuilder::new(real_shell.to_string_lossy().into_owned());
+        if let Some(command) = command {
+            builder.arg("-c");
+            builder.arg(command);
+        } else {
+            builder.arg("-l");
+        }
 
         let child = pair
             .slave
-            .spawn_command(command)
+            .spawn_command(builder)
             .with_context(|| format!("failed to launch login shell {}", real_shell.display()))?;
         let pty_reader = pair
             .master
@@ -646,6 +680,55 @@ mod imp {
                     Err(error) if error.kind() == ErrorKind::Interrupted => {}
                     Err(error) => {
                         store_thread_error(&error_slot, format!("failed to read stdin: {error}"));
+                        break;
+                    }
+                }
+            }
+        });
+    }
+
+    fn spawn_command_input_forwarder(
+        mut child_stdin: ChildStdin,
+        writer: Arc<Mutex<CastWriter>>,
+        error_slot: Arc<Mutex<Option<String>>>,
+    ) {
+        let _input_thread = thread::spawn(move || {
+            let mut input = io::stdin();
+            let mut buffer = [0_u8; 4096];
+
+            loop {
+                match input.read(&mut buffer) {
+                    Ok(0) => break,
+                    Ok(read_count) => {
+                        if let Err(error) = child_stdin
+                            .write_all(&buffer[..read_count])
+                            .and_then(|()| child_stdin.flush())
+                        {
+                            if is_expected_command_pipe_shutdown_error(&error) {
+                                break;
+                            }
+                            store_thread_error(
+                                &error_slot,
+                                format!("failed to forward command stdin: {error}"),
+                            );
+                            break;
+                        }
+                        if let Err(error) =
+                            write_cast_chunk(&writer, unix_ms(), "i", &buffer[..read_count])
+                        {
+                            store_thread_error(
+                                &error_slot,
+                                format!("failed to write command input event: {error}"),
+                            );
+                            break;
+                        }
+                    }
+                    Err(error) if error.kind() == ErrorKind::Interrupted => {}
+                    Err(error) => {
+                        store_thread_error(
+                            &error_slot,
+                            format!("failed to read command stdin: {error}"),
+                        );
                         break;
                     }
                 }
@@ -824,6 +907,9 @@ mod imp {
                             .context("failed to write output event")?;
                     }
                     Err(error) if error.kind() == ErrorKind::Interrupted => {}
+                    Err(error) if error.kind() == ErrorKind::WouldBlock => {
+                        thread::sleep(Duration::from_millis(5));
+                    }
                     Err(error) if is_expected_pty_shutdown_error(&error) => break,
                     Err(error) => return Err(error).context("failed to read PTY output"),
                 }
@@ -859,11 +945,15 @@ mod imp {
     fn is_expected_pty_shutdown_error(error: &io::Error) -> bool {
         matches!(
             error.kind(),
-            ErrorKind::BrokenPipe
-                | ErrorKind::ConnectionReset
-                | ErrorKind::UnexpectedEof
-                | ErrorKind::WouldBlock
+            ErrorKind::BrokenPipe | ErrorKind::ConnectionReset | ErrorKind::UnexpectedEof
         ) || matches!(error.raw_os_error(), Some(5 | 32))
+    }
+
+    fn is_expected_command_pipe_shutdown_error(error: &io::Error) -> bool {
+        matches!(
+            error.kind(),
+            ErrorKind::BrokenPipe | ErrorKind::ConnectionReset | ErrorKind::UnexpectedEof
+        ) || matches!(error.raw_os_error(), Some(32 | 104))
     }
 
     fn is_expected_pty_shutdown_anyhow(error: &anyhow::Error) -> bool {
@@ -1096,7 +1186,7 @@ mod imp {
         bail!("recording is only supported on Unix platforms")
     }
 
-    pub(crate) fn record_ssh(_config: &RecordingConfig) -> Result<i32> {
+    pub(crate) fn record_ssh(_config: &RecordingConfig, _command: Option<&str>) -> Result<i32> {
         bail!("recording is only supported on Unix platforms")
     }
 }
