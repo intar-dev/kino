@@ -14,7 +14,8 @@ mod imp {
     use std::io::ErrorKind;
     use std::io::{self, IsTerminal, Read, Write};
     use std::path::{Path, PathBuf};
-    use std::process::Command;
+    use std::process::{Command, Stdio};
+    use std::sync::mpsc;
     use std::sync::{Arc, Mutex};
     use std::thread;
     use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -291,41 +292,26 @@ mod imp {
             )
         })?;
 
-        if !command.is_empty() {
-            let mut input = command.to_owned();
-            input.push('\n');
-            writer
-                .write_input_bytes(unix_ms(), input.as_bytes())
-                .with_context(|| {
-                    format!("failed to write input event to {}", cast_path.display())
-                })?;
-        }
+        write_command_input_event(&mut writer, &cast_path, command)?;
 
-        let output = Command::new(&config.real_shell)
-            .args(["-c", command])
-            .output()
-            .with_context(|| {
-                format!(
-                    "failed to run shell command via {}",
-                    config.real_shell.display()
-                )
-            })?;
-        let exit_code = output.status.code().unwrap_or(1);
+        let mut child = spawn_recorded_command(&config.real_shell, command)?;
+        let CommandOutputCapture {
+            rx,
+            stdout_handle,
+            stderr_handle,
+            stdout_error,
+            stderr_error,
+        } = start_command_output_capture(&mut child)?;
 
-        if !output.stdout.is_empty() {
-            writer
-                .write_output_bytes(unix_ms(), &output.stdout)
-                .with_context(|| {
-                    format!("failed to write stdout event to {}", cast_path.display())
-                })?;
-        }
-        if !output.stderr.is_empty() {
-            writer
-                .write_output_bytes(unix_ms(), &output.stderr)
-                .with_context(|| {
-                    format!("failed to write stderr event to {}", cast_path.display())
-                })?;
-        }
+        forward_and_record_command_output(&mut writer, &cast_path, rx)?;
+        finalize_command_output_capture(
+            stdout_handle,
+            stderr_handle,
+            &stdout_error,
+            &stderr_error,
+        )?;
+
+        let exit_code = wait_for_command_exit(&mut child)?;
 
         writer
             .finish(unix_ms())
@@ -433,6 +419,156 @@ mod imp {
     type PtyReader = Box<dyn Read + Send>;
     type PtyMaster = Box<dyn portable_pty::MasterPty + Send>;
     type PtyWriter = Box<dyn Write + Send>;
+
+    #[derive(Debug, Clone, Copy)]
+    enum CommandOutputStream {
+        Stdout,
+        Stderr,
+    }
+
+    struct CommandOutputCapture {
+        rx: mpsc::Receiver<CommandOutputChunk>,
+        stdout_handle: thread::JoinHandle<()>,
+        stderr_handle: thread::JoinHandle<()>,
+        stdout_error: Arc<Mutex<Option<String>>>,
+        stderr_error: Arc<Mutex<Option<String>>>,
+    }
+
+    struct CommandOutputChunk {
+        ts_unix_ms: u64,
+        stream: CommandOutputStream,
+        bytes: Vec<u8>,
+    }
+
+    fn write_command_input_event(
+        writer: &mut CastWriter,
+        cast_path: &Path,
+        command: &str,
+    ) -> Result<()> {
+        if command.is_empty() {
+            return Ok(());
+        }
+
+        let mut input = command.to_owned();
+        input.push('\n');
+        writer
+            .write_input_bytes(unix_ms(), input.as_bytes())
+            .with_context(|| format!("failed to write input event to {}", cast_path.display()))
+    }
+
+    fn spawn_recorded_command(real_shell: &Path, command: &str) -> Result<std::process::Child> {
+        Command::new(real_shell)
+            .args(["-c", command])
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .with_context(|| format!("failed to run shell command via {}", real_shell.display()))
+    }
+
+    fn start_command_output_capture(
+        child: &mut std::process::Child,
+    ) -> Result<CommandOutputCapture> {
+        let stdout = child
+            .stdout
+            .take()
+            .ok_or_else(|| anyhow!("failed to capture command stdout"))?;
+        let stderr = child
+            .stderr
+            .take()
+            .ok_or_else(|| anyhow!("failed to capture command stderr"))?;
+
+        let (tx, rx) = mpsc::channel::<CommandOutputChunk>();
+        let stdout_error = Arc::new(Mutex::new(None::<String>));
+        let stderr_error = Arc::new(Mutex::new(None::<String>));
+        let stdout_handle = spawn_command_output_forwarder(
+            stdout,
+            CommandOutputStream::Stdout,
+            tx.clone(),
+            Arc::clone(&stdout_error),
+        );
+        let stderr_handle = spawn_command_output_forwarder(
+            stderr,
+            CommandOutputStream::Stderr,
+            tx,
+            Arc::clone(&stderr_error),
+        );
+
+        Ok(CommandOutputCapture {
+            rx,
+            stdout_handle,
+            stderr_handle,
+            stdout_error,
+            stderr_error,
+        })
+    }
+
+    fn forward_and_record_command_output(
+        writer: &mut CastWriter,
+        cast_path: &Path,
+        rx: mpsc::Receiver<CommandOutputChunk>,
+    ) -> Result<()> {
+        let mut stdout_target = io::stdout();
+        let mut stderr_target = io::stderr();
+
+        for chunk in rx {
+            match chunk.stream {
+                CommandOutputStream::Stdout => {
+                    stdout_target
+                        .write_all(&chunk.bytes)
+                        .context("failed to forward command stdout")?;
+                    stdout_target
+                        .flush()
+                        .context("failed to flush command stdout")?;
+                }
+                CommandOutputStream::Stderr => {
+                    stderr_target
+                        .write_all(&chunk.bytes)
+                        .context("failed to forward command stderr")?;
+                    stderr_target
+                        .flush()
+                        .context("failed to flush command stderr")?;
+                }
+            }
+
+            writer
+                .write_output_bytes(chunk.ts_unix_ms, &chunk.bytes)
+                .with_context(|| {
+                    format!(
+                        "failed to write command output event to {}",
+                        cast_path.display()
+                    )
+                })?;
+        }
+
+        Ok(())
+    }
+
+    fn finalize_command_output_capture(
+        stdout_handle: thread::JoinHandle<()>,
+        stderr_handle: thread::JoinHandle<()>,
+        stdout_error: &Arc<Mutex<Option<String>>>,
+        stderr_error: &Arc<Mutex<Option<String>>>,
+    ) -> Result<()> {
+        join_command_output_forwarder(stdout_handle)?;
+        join_command_output_forwarder(stderr_handle)?;
+
+        if let Some(message) = take_thread_error(stdout_error) {
+            return Err(anyhow!(message));
+        }
+        if let Some(message) = take_thread_error(stderr_error) {
+            return Err(anyhow!(message));
+        }
+
+        Ok(())
+    }
+
+    fn wait_for_command_exit(child: &mut std::process::Child) -> Result<i32> {
+        Ok(child
+            .wait()
+            .context("failed waiting for shell command")?
+            .code()
+            .unwrap_or(1))
+    }
 
     fn start_login_shell(
         real_shell: &Path,
@@ -549,6 +685,56 @@ mod imp {
         });
 
         Ok(handle)
+    }
+
+    fn spawn_command_output_forwarder<R>(
+        mut reader: R,
+        stream: CommandOutputStream,
+        tx: mpsc::Sender<CommandOutputChunk>,
+        error_slot: Arc<Mutex<Option<String>>>,
+    ) -> thread::JoinHandle<()>
+    where
+        R: Read + Send + 'static,
+    {
+        thread::spawn(move || {
+            let mut buffer = [0_u8; 4096];
+            loop {
+                match reader.read(&mut buffer) {
+                    Ok(0) => break,
+                    Ok(read_count) => {
+                        if tx
+                            .send(CommandOutputChunk {
+                                ts_unix_ms: unix_ms(),
+                                stream,
+                                bytes: buffer[..read_count].to_vec(),
+                            })
+                            .is_err()
+                        {
+                            break;
+                        }
+                    }
+                    Err(error) if error.kind() == ErrorKind::Interrupted => {}
+                    Err(error) => {
+                        let label = match stream {
+                            CommandOutputStream::Stdout => "stdout",
+                            CommandOutputStream::Stderr => "stderr",
+                        };
+                        store_thread_error(
+                            &error_slot,
+                            format!("failed to read command {label}: {error}"),
+                        );
+                        break;
+                    }
+                }
+            }
+        })
+    }
+
+    fn join_command_output_forwarder(handle: thread::JoinHandle<()>) -> Result<()> {
+        handle
+            .join()
+            .map_err(|_| anyhow!("command output forwarder thread panicked"))?;
+        Ok(())
     }
 
     fn create_session_file(
