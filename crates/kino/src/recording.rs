@@ -11,8 +11,8 @@ mod imp {
     use signal_hook::iterator::{Handle as SignalsHandle, Signals};
     use std::collections::BTreeMap;
     use std::fs::{self, File, OpenOptions};
-    use std::io::{self, IsTerminal, Read, Write};
     use std::io::ErrorKind;
+    use std::io::{self, IsTerminal, Read, Write};
     use std::path::{Path, PathBuf};
     use std::process::Command;
     use std::sync::{Arc, Mutex};
@@ -192,7 +192,8 @@ mod imp {
                     Err(error) => {
                         let valid_up_to = error.valid_up_to();
                         if valid_up_to > 0 {
-                            let valid = String::from_utf8_lossy(&pending[..valid_up_to]).into_owned();
+                            let valid =
+                                String::from_utf8_lossy(&pending[..valid_up_to]).into_owned();
                             Self::write_event_line(
                                 file,
                                 start_ts_unix_ms,
@@ -203,24 +204,21 @@ mod imp {
                             )?;
                         }
 
-                        match error.error_len() {
-                            Some(invalid_len) => {
-                                Self::write_event_line(
-                                    file,
-                                    start_ts_unix_ms,
-                                    last_sync_ts_unix_ms,
-                                    ts_unix_ms,
-                                    kind,
-                                    "\u{FFFD}",
-                                )?;
-                                pending.drain(..valid_up_to + invalid_len);
+                        if let Some(invalid_len) = error.error_len() {
+                            Self::write_event_line(
+                                file,
+                                start_ts_unix_ms,
+                                last_sync_ts_unix_ms,
+                                ts_unix_ms,
+                                kind,
+                                "\u{FFFD}",
+                            )?;
+                            pending.drain(..valid_up_to + invalid_len);
+                        } else {
+                            if valid_up_to > 0 {
+                                pending.drain(..valid_up_to);
                             }
-                            None => {
-                                if valid_up_to > 0 {
-                                    pending.drain(..valid_up_to);
-                                }
-                                return Ok(());
-                            }
+                            return Ok(());
                         }
                     }
                 }
@@ -506,7 +504,7 @@ mod imp {
                             break;
                         }
                     }
-                    Err(error) if error.kind() == ErrorKind::Interrupted => continue,
+                    Err(error) if error.kind() == ErrorKind::Interrupted => {}
                     Err(error) => {
                         store_thread_error(&error_slot, format!("failed to read stdin: {error}"));
                         break;
@@ -616,7 +614,7 @@ mod imp {
                     write_cast_chunk(writer, unix_ms(), "o", &buffer[..read_count])
                         .context("failed to write output event")?;
                 }
-                Err(error) if error.kind() == ErrorKind::Interrupted => continue,
+                Err(error) if error.kind() == ErrorKind::Interrupted => {}
                 Err(error) if is_expected_pty_shutdown_error(&error) => break,
                 Err(error) => return Err(error).context("failed to read PTY output"),
             }
@@ -745,7 +743,7 @@ mod imp {
                 .write_resize(start_ts_unix_ms + 900, 100, 30)
                 .unwrap_or_else(|error| panic!("write resize failed: {error}"));
             writer
-                .finish()
+                .finish(start_ts_unix_ms + 900)
                 .unwrap_or_else(|error| panic!("finish failed: {error}"));
 
             let content = fs::read_to_string(cast_path)
