@@ -5,7 +5,7 @@ mod imp {
     use crate::config::RecordingConfig;
     use anyhow::{Context, Result, anyhow, bail};
     use crossterm::terminal;
-    use portable_pty::{CommandBuilder, PtySize, native_pty_system};
+    use portable_pty::{CommandBuilder, MasterPty, PtySize, native_pty_system};
     use serde::Serialize;
     use signal_hook::consts::signal::SIGWINCH;
     use signal_hook::iterator::{Handle as SignalsHandle, Signals};
@@ -328,8 +328,9 @@ mod imp {
             prepare_interactive_writer(config, width, height)?;
         let input_error = Arc::new(Mutex::new(None::<String>));
         let resize_error = Arc::new(Mutex::new(None::<String>));
-        let (mut child, mut pty_reader, pty_writer, pty_master) =
+        let (child, pty_reader, pty_writer, pty_master, slave_keepalive) =
             start_login_shell(&config.real_shell, width, height)?;
+        let mut child_killer = child.clone_killer();
 
         spawn_input_forwarder(
             pty_writer,
@@ -341,14 +342,15 @@ mod imp {
             Arc::clone(&shared_writer),
             Arc::clone(&resize_error),
         )?;
+        let output_handle = spawn_shell_output_forwarder(pty_reader, Arc::clone(&shared_writer));
+        let wait_handle = spawn_shell_waiter(child, slave_keepalive);
 
-        let output_result = proxy_shell_output(&mut pty_reader, &shared_writer);
+        let output_result = join_shell_output_forwarder(output_handle);
         if output_result.is_err() {
-            let _ = child.kill();
+            let _ = child_killer.kill();
         }
 
-        let status = child.wait().context("failed waiting for login shell")?;
-        let exit_code = i32::try_from(status.exit_code()).unwrap_or(1);
+        let exit_code = join_shell_waiter(wait_handle)?;
         resize_handle.close();
 
         if let Some(message) = take_thread_error(&input_error) {
@@ -574,7 +576,7 @@ mod imp {
         real_shell: &Path,
         width: u16,
         height: u16,
-    ) -> Result<(PtyChild, PtyReader, PtyWriter, PtyMaster)> {
+    ) -> Result<(PtyChild, PtyReader, PtyWriter, PtyMaster, Option<File>)> {
         let pty_system = native_pty_system();
         let pair = pty_system
             .openpty(PtySize {
@@ -600,8 +602,9 @@ mod imp {
             .master
             .take_writer()
             .context("failed to take PTY writer")?;
+        let slave_keepalive = open_slave_keepalive(pair.master.as_ref())?;
 
-        Ok((child, pty_reader, pty_writer, pair.master))
+        Ok((child, pty_reader, pty_writer, pair.master, slave_keepalive))
     }
 
     fn spawn_input_forwarder(
@@ -782,31 +785,75 @@ mod imp {
         }
     }
 
-    fn proxy_shell_output(
-        pty_reader: &mut dyn Read,
-        writer: &Arc<Mutex<CastWriter>>,
-    ) -> Result<()> {
-        let mut stdout = io::stdout();
-        let mut buffer = [0_u8; 4096];
+    fn open_slave_keepalive(master: &dyn MasterPty) -> Result<Option<File>> {
+        let Some(tty_name) = master.tty_name() else {
+            return Ok(None);
+        };
 
-        loop {
-            match pty_reader.read(&mut buffer) {
-                Ok(0) => break,
-                Ok(read_count) => {
-                    stdout
-                        .write_all(&buffer[..read_count])
-                        .context("failed to forward shell output to stdout")?;
-                    stdout.flush().context("failed to flush stdout")?;
-                    write_cast_chunk(writer, unix_ms(), "o", &buffer[..read_count])
-                        .context("failed to write output event")?;
+        let file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&tty_name)
+            .with_context(|| {
+                format!(
+                    "failed to open PTY slave keepalive handle {}",
+                    tty_name.display()
+                )
+            })?;
+
+        Ok(Some(file))
+    }
+
+    fn spawn_shell_output_forwarder(
+        mut pty_reader: PtyReader,
+        writer: Arc<Mutex<CastWriter>>,
+    ) -> thread::JoinHandle<Result<()>> {
+        thread::spawn(move || {
+            let mut stdout = io::stdout();
+            let mut buffer = [0_u8; 4096];
+
+            loop {
+                match pty_reader.read(&mut buffer) {
+                    Ok(0) => break,
+                    Ok(read_count) => {
+                        stdout
+                            .write_all(&buffer[..read_count])
+                            .context("failed to forward shell output to stdout")?;
+                        stdout.flush().context("failed to flush stdout")?;
+                        write_cast_chunk(&writer, unix_ms(), "o", &buffer[..read_count])
+                            .context("failed to write output event")?;
+                    }
+                    Err(error) if error.kind() == ErrorKind::Interrupted => {}
+                    Err(error) if is_expected_pty_shutdown_error(&error) => break,
+                    Err(error) => return Err(error).context("failed to read PTY output"),
                 }
-                Err(error) if error.kind() == ErrorKind::Interrupted => {}
-                Err(error) if is_expected_pty_shutdown_error(&error) => break,
-                Err(error) => return Err(error).context("failed to read PTY output"),
             }
-        }
 
-        Ok(())
+            Ok(())
+        })
+    }
+
+    fn join_shell_output_forwarder(handle: thread::JoinHandle<Result<()>>) -> Result<()> {
+        handle
+            .join()
+            .map_err(|_| anyhow!("shell output forwarder thread panicked"))?
+    }
+
+    fn spawn_shell_waiter(
+        mut child: PtyChild,
+        slave_keepalive: Option<File>,
+    ) -> thread::JoinHandle<Result<i32>> {
+        thread::spawn(move || {
+            let status = child.wait().context("failed waiting for login shell")?;
+            drop(slave_keepalive);
+            Ok(i32::try_from(status.exit_code()).unwrap_or(1))
+        })
+    }
+
+    fn join_shell_waiter(handle: thread::JoinHandle<Result<i32>>) -> Result<i32> {
+        handle
+            .join()
+            .map_err(|_| anyhow!("shell waiter thread panicked"))?
     }
 
     fn is_expected_pty_shutdown_error(error: &io::Error) -> bool {
