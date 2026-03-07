@@ -12,6 +12,7 @@ mod imp {
     use std::collections::BTreeMap;
     use std::fs::{self, File, OpenOptions};
     use std::io::{self, IsTerminal, Read, Write};
+    use std::io::ErrorKind;
     use std::path::{Path, PathBuf};
     use std::process::Command;
     use std::sync::{Arc, Mutex};
@@ -44,6 +45,8 @@ mod imp {
         file: File,
         start_ts_unix_ms: u64,
         last_sync_ts_unix_ms: u64,
+        pending_input_bytes: Vec<u8>,
+        pending_output_bytes: Vec<u8>,
     }
 
     impl CastWriter {
@@ -61,6 +64,8 @@ mod imp {
                 file,
                 start_ts_unix_ms,
                 last_sync_ts_unix_ms: start_ts_unix_ms,
+                pending_input_bytes: Vec::new(),
+                pending_output_bytes: Vec::new(),
             };
 
             let header = CastHeader {
@@ -74,40 +79,77 @@ mod imp {
             let line = serde_json::to_string(&header).map_err(io::Error::other)?;
             writer.file.write_all(line.as_bytes())?;
             writer.file.write_all(b"\n")?;
+            writer.file.sync_data()?;
 
             Ok((writer, path))
         }
 
         fn write_input_bytes(&mut self, ts_unix_ms: u64, bytes: &[u8]) -> io::Result<()> {
-            self.write_event(ts_unix_ms, "i", bytes)
+            Self::write_stream_event(
+                &mut self.file,
+                self.start_ts_unix_ms,
+                &mut self.last_sync_ts_unix_ms,
+                &mut self.pending_input_bytes,
+                ts_unix_ms,
+                "i",
+                bytes,
+            )
         }
 
         fn write_output_bytes(&mut self, ts_unix_ms: u64, bytes: &[u8]) -> io::Result<()> {
-            self.write_event(ts_unix_ms, "o", bytes)
+            Self::write_stream_event(
+                &mut self.file,
+                self.start_ts_unix_ms,
+                &mut self.last_sync_ts_unix_ms,
+                &mut self.pending_output_bytes,
+                ts_unix_ms,
+                "o",
+                bytes,
+            )
         }
 
         fn write_resize(&mut self, ts_unix_ms: u64, width: u16, height: u16) -> io::Result<()> {
             let data = format!("{width}x{height}");
-            self.write_event(ts_unix_ms, "r", data.as_bytes())
+            self.write_event_text(ts_unix_ms, "r", &data)
         }
 
-        fn finish(&mut self) -> io::Result<()> {
+        fn finish(&mut self, ts_unix_ms: u64) -> io::Result<()> {
+            self.flush_pending_stream_bytes(ts_unix_ms)?;
             self.file.sync_all()
         }
 
-        fn write_event(
+        fn write_event_text(
             &mut self,
             ts_unix_ms: u64,
             kind: &'static str,
-            bytes: &[u8],
+            data: &str,
         ) -> io::Result<()> {
             let rel = Duration::from_millis(ts_unix_ms.saturating_sub(self.start_ts_unix_ms))
                 .as_secs_f64();
-            let data = String::from_utf8_lossy(bytes).into_owned();
             let line = serde_json::to_string(&(rel, kind, data)).map_err(io::Error::other)?;
             self.file.write_all(line.as_bytes())?;
             self.file.write_all(b"\n")?;
             self.sync_data_if_due(ts_unix_ms)?;
+            Ok(())
+        }
+
+        fn flush_pending_stream_bytes(&mut self, ts_unix_ms: u64) -> io::Result<()> {
+            Self::flush_pending_bytes(
+                &mut self.file,
+                self.start_ts_unix_ms,
+                &mut self.last_sync_ts_unix_ms,
+                &mut self.pending_input_bytes,
+                ts_unix_ms,
+                "i",
+            )?;
+            Self::flush_pending_bytes(
+                &mut self.file,
+                self.start_ts_unix_ms,
+                &mut self.last_sync_ts_unix_ms,
+                &mut self.pending_output_bytes,
+                ts_unix_ms,
+                "o",
+            )?;
             Ok(())
         }
 
@@ -117,6 +159,117 @@ mod imp {
             }
             self.file.sync_data()?;
             self.last_sync_ts_unix_ms = ts_unix_ms;
+            Ok(())
+        }
+
+        fn write_stream_event(
+            file: &mut File,
+            start_ts_unix_ms: u64,
+            last_sync_ts_unix_ms: &mut u64,
+            pending: &mut Vec<u8>,
+            ts_unix_ms: u64,
+            kind: &'static str,
+            bytes: &[u8],
+        ) -> io::Result<()> {
+            pending.extend_from_slice(bytes);
+
+            loop {
+                match std::str::from_utf8(pending) {
+                    Ok(valid) => {
+                        if !valid.is_empty() {
+                            Self::write_event_line(
+                                file,
+                                start_ts_unix_ms,
+                                last_sync_ts_unix_ms,
+                                ts_unix_ms,
+                                kind,
+                                valid,
+                            )?;
+                        }
+                        pending.clear();
+                        return Ok(());
+                    }
+                    Err(error) => {
+                        let valid_up_to = error.valid_up_to();
+                        if valid_up_to > 0 {
+                            let valid = String::from_utf8_lossy(&pending[..valid_up_to]).into_owned();
+                            Self::write_event_line(
+                                file,
+                                start_ts_unix_ms,
+                                last_sync_ts_unix_ms,
+                                ts_unix_ms,
+                                kind,
+                                &valid,
+                            )?;
+                        }
+
+                        match error.error_len() {
+                            Some(invalid_len) => {
+                                Self::write_event_line(
+                                    file,
+                                    start_ts_unix_ms,
+                                    last_sync_ts_unix_ms,
+                                    ts_unix_ms,
+                                    kind,
+                                    "\u{FFFD}",
+                                )?;
+                                pending.drain(..valid_up_to + invalid_len);
+                            }
+                            None => {
+                                if valid_up_to > 0 {
+                                    pending.drain(..valid_up_to);
+                                }
+                                return Ok(());
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        fn flush_pending_bytes(
+            file: &mut File,
+            start_ts_unix_ms: u64,
+            last_sync_ts_unix_ms: &mut u64,
+            pending: &mut Vec<u8>,
+            ts_unix_ms: u64,
+            kind: &'static str,
+        ) -> io::Result<()> {
+            if pending.is_empty() {
+                return Ok(());
+            }
+            let data = String::from_utf8_lossy(pending).into_owned();
+            pending.clear();
+            if data.is_empty() {
+                return Ok(());
+            }
+            Self::write_event_line(
+                file,
+                start_ts_unix_ms,
+                last_sync_ts_unix_ms,
+                ts_unix_ms,
+                kind,
+                &data,
+            )
+        }
+
+        fn write_event_line(
+            file: &mut File,
+            start_ts_unix_ms: u64,
+            last_sync_ts_unix_ms: &mut u64,
+            ts_unix_ms: u64,
+            kind: &'static str,
+            data: &str,
+        ) -> io::Result<()> {
+            let rel =
+                Duration::from_millis(ts_unix_ms.saturating_sub(start_ts_unix_ms)).as_secs_f64();
+            let line = serde_json::to_string(&(rel, kind, data)).map_err(io::Error::other)?;
+            file.write_all(line.as_bytes())?;
+            file.write_all(b"\n")?;
+            if ts_unix_ms.saturating_sub(*last_sync_ts_unix_ms) >= CAST_SYNC_INTERVAL_MS {
+                file.sync_data()?;
+                *last_sync_ts_unix_ms = ts_unix_ms;
+            }
             Ok(())
         }
     }
@@ -177,7 +330,7 @@ mod imp {
         }
 
         writer
-            .finish()
+            .finish(unix_ms())
             .with_context(|| format!("failed to flush cast file {}", cast_path.display()))?;
 
         Ok(exit_code)
@@ -228,7 +381,7 @@ mod imp {
                 .lock()
                 .map_err(|_| anyhow!("cast writer lock poisoned"))?;
             writer
-                .finish()
+                .finish(unix_ms())
                 .with_context(|| format!("failed to flush cast file {}", cast_path.display()))?;
         }
 
@@ -334,6 +487,9 @@ mod imp {
                             .write_all(&buffer[..read_count])
                             .and_then(|()| pty_writer.flush())
                         {
+                            if is_expected_pty_shutdown_error(&error) {
+                                break;
+                            }
                             store_thread_error(
                                 &error_slot,
                                 format!("failed to forward input to shell: {error}"),
@@ -350,6 +506,7 @@ mod imp {
                             break;
                         }
                     }
+                    Err(error) if error.kind() == ErrorKind::Interrupted => continue,
                     Err(error) => {
                         store_thread_error(&error_slot, format!("failed to read stdin: {error}"));
                         break;
@@ -377,6 +534,9 @@ mod imp {
                     pixel_height: 0,
                 };
                 if let Err(error) = pty_master.resize(size) {
+                    if is_expected_pty_shutdown_anyhow(&error) {
+                        break;
+                    }
                     store_thread_error(&error_slot, format!("failed to resize PTY: {error}"));
                     break;
                 }
@@ -456,11 +616,30 @@ mod imp {
                     write_cast_chunk(writer, unix_ms(), "o", &buffer[..read_count])
                         .context("failed to write output event")?;
                 }
+                Err(error) if error.kind() == ErrorKind::Interrupted => continue,
+                Err(error) if is_expected_pty_shutdown_error(&error) => break,
                 Err(error) => return Err(error).context("failed to read PTY output"),
             }
         }
 
         Ok(())
+    }
+
+    fn is_expected_pty_shutdown_error(error: &io::Error) -> bool {
+        matches!(
+            error.kind(),
+            ErrorKind::BrokenPipe
+                | ErrorKind::ConnectionReset
+                | ErrorKind::UnexpectedEof
+                | ErrorKind::WouldBlock
+        ) || matches!(error.raw_os_error(), Some(5 | 32))
+    }
+
+    fn is_expected_pty_shutdown_anyhow(error: &anyhow::Error) -> bool {
+        error
+            .chain()
+            .find_map(|cause| cause.downcast_ref::<io::Error>())
+            .is_some_and(is_expected_pty_shutdown_error)
     }
 
     fn write_resize_event(
